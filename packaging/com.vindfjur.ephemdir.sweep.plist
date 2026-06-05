@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS LaunchAgent template for periodic ephemdir cleanup.
+
+  Install:
+    1. Replace /usr/local/bin/ephemdir with the output of `which ephemdir`.
+    2. Copy this file to ~/Library/LaunchAgents/
+    3. Run: launchctl load ~/Library/LaunchAgents/com.vindfjur.ephemdir.sweep.plist
+
+  It sweeps once at login (RunAtLoad) and then every 600 seconds.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.vindfjur.ephemdir.sweep</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/ephemdir</string>
+        <string>sweep</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>600</integer>
+</dict>
+</plist>

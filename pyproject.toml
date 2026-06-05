@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ephemdir"
+version = "0.1.0"
+description = "Create self-cleaning ephemeral directories that vanish after a lifetime or on restart."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "vindfjur" }]
+keywords = ["temporary", "directory", "tempdir", "ephemeral", "cleanup", "tmp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Filesystems",
+    "Typing :: Typed",
+]
+dependencies = [
+    "coolname>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "pytest-cov>=4",
+    "build>=1",
+    "twine>=5",
+]
+
+[project.urls]
+Homepage = "https://github.com/vindfjur/ephemdir"
+Repository = "https://github.com/vindfjur/ephemdir"
+Issues = "https://github.com/vindfjur/ephemdir/issues"
+Changelog = "https://github.com/vindfjur/ephemdir/blob/main/CHANGELOG.md"
+
+[project.scripts]
+ephemdir = "ephemdir.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ephemdir = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
