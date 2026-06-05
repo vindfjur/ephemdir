@@ -15,10 +15,11 @@ import logging
 import sys
 import time
 from datetime import datetime
-from typing import Optional, Sequence
+from typing import Any, Sequence
 
 from . import __version__
-from .core import registered, sweep, tempdir
+from ._service import install_service, uninstall_service
+from .core import _UNSET, registered, sweep, tempdir
 
 logger = logging.getLogger("ephemdir")
 
@@ -39,21 +40,31 @@ def _configure_logging(verbosity: int, quiet: bool) -> None:
     logging.basicConfig(level=level, format="%(message)s", stream=sys.stderr)
 
 
-def _format_timestamp(value: Optional[float]) -> str:
-    """Render a Unix timestamp as a readable local time, or a dash."""
-    if value is None:
+def _format_timestamp(value: object) -> str:
+    """Render a Unix timestamp as a readable local time, or ``never``."""
+    if not isinstance(value, (int, float)):
         return "never"
     return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _cmd_new(args: argparse.Namespace) -> int:
-    directory = tempdir(
-        lifetime=args.lifetime,
-        remove_on_restart=not args.keep_on_restart,
-        parent=args.parent,
-        prefix=args.prefix,
-        words=args.words,
-    )
+    # Forward only options the user actually passed, so anything left unset is
+    # resolved from the user config file (and then the built-in defaults).
+    kwargs: dict[str, Any] = {}
+    if args.lifetime is not _UNSET:
+        kwargs["lifetime"] = args.lifetime
+    if args.parent is not _UNSET:
+        kwargs["parent"] = args.parent
+    if args.prefix is not _UNSET:
+        kwargs["prefix"] = args.prefix
+    if args.words is not _UNSET:
+        kwargs["words"] = args.words
+    if args.keep_on_restart is not _UNSET:
+        kwargs["remove_on_restart"] = not args.keep_on_restart
+    if args.keep_while_in_use is not _UNSET:
+        kwargs["keep_while_in_use"] = args.keep_while_in_use
+
+    directory = tempdir(**kwargs)
     # The path goes to stdout so it can be captured in shell pipelines;
     # all diagnostics go to stderr via the logger.
     print(directory.path)
@@ -89,6 +100,17 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_install_service(args: argparse.Namespace) -> int:
+    message = install_service(interval=args.interval)
+    logger.warning("%s", message)
+    return 0
+
+
+def _cmd_uninstall_service(args: argparse.Namespace) -> int:
+    logger.warning("%s", uninstall_service())
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the argument parser for the ``ephemdir`` command."""
     parser = argparse.ArgumentParser(
@@ -101,15 +123,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command", required=True)
 
+    # Unset options default to the _UNSET sentinel so they can be resolved from
+    # the user config file rather than always overriding it.
     new = sub.add_parser("new", help="create a new ephemeral directory")
-    new.add_argument("-l", "--lifetime", default=None,
+    new.add_argument("-l", "--lifetime", default=_UNSET,
                      help='time to live, e.g. "2h", "30m", "1h30m" (default: until restart)')
-    new.add_argument("--keep-on-restart", action="store_true",
+    new.add_argument("--keep-on-restart", action="store_const", const=True, default=_UNSET,
                      help="do not remove the directory after a restart")
-    new.add_argument("-p", "--parent", default=None,
+    new.add_argument("--keep-while-in-use", action="store_const", const=True, default=_UNSET,
+                     help="do not delete while files are still open inside")
+    new.add_argument("-p", "--parent", default=_UNSET,
                      help="where to create the directory (default: current directory)")
-    new.add_argument("--prefix", default="", help="prefix for the generated name")
-    new.add_argument("--words", type=int, default=2, help="words in the generated name (default: 2)")
+    new.add_argument("--prefix", default=_UNSET, help="prefix for the generated name")
+    new.add_argument("--words", type=int, default=_UNSET,
+                     help="words in the generated name (default: 2)")
     new.set_defaults(func=_cmd_new)
 
     sweep_cmd = sub.add_parser("sweep", help="remove directories that are due for cleanup")
@@ -125,15 +152,25 @@ def build_parser() -> argparse.ArgumentParser:
                        help="seconds between sweeps (default: 600)")
     watch.set_defaults(func=_cmd_watch)
 
+    install = sub.add_parser("install-service",
+                             help="install a scheduled sweep service for this platform")
+    install.add_argument("--interval", type=int, default=600,
+                         help="seconds between sweeps (default: 600)")
+    install.set_defaults(func=_cmd_install_service)
+
+    uninstall = sub.add_parser("uninstall-service", help="remove the scheduled sweep service")
+    uninstall.set_defaults(func=_cmd_uninstall_service)
+
     return parser
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     """Entry point for the ``ephemdir`` console script."""
     parser = build_parser()
     args = parser.parse_args(argv)
     _configure_logging(args.verbose, args.quiet)
-    return args.func(args)
+    exit_code: int = args.func(args)
+    return exit_code
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ import sys
 import time
 from pathlib import Path
 
-__all__ = ["user_data_dir", "boot_time", "same_boot"]
+__all__ = ["user_data_dir", "user_config_dir", "boot_time", "same_boot"]
 
 # Two boot-time readings within this many seconds are treated as the same boot.
 # Boot time derived from uptime can jitter slightly between reads, so we never
@@ -39,6 +39,31 @@ def user_data_dir(app_name: str = "ephemdir") -> Path:
     else:
         base = os.environ.get("XDG_DATA_HOME")
         root = Path(base) if base else Path.home() / ".local" / "share"
+
+    path = root / app_name
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def user_config_dir(app_name: str = "ephemdir") -> Path:
+    """Return the per-user configuration directory for ``app_name``.
+
+    Follows the platform conventions:
+
+    * Windows: ``%APPDATA%\\<app_name>`` (roaming)
+    * macOS:   ``~/Library/Application Support/<app_name>``
+    * Linux:   ``$XDG_CONFIG_HOME/<app_name>`` or ``~/.config/<app_name>``
+
+    The directory is created if it does not exist.
+    """
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
+        root = Path(base) if base else Path.home() / "AppData" / "Roaming"
+    elif sys.platform == "darwin":
+        root = Path.home() / "Library" / "Application Support"
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME")
+        root = Path(base) if base else Path.home() / ".config"
 
     path = root / app_name
     path.mkdir(parents=True, exist_ok=True)
@@ -72,7 +97,7 @@ def same_boot(a: float | None, b: float | None) -> bool:
 def _boot_time_linux() -> float | None:
     """Read boot time from ``/proc/uptime`` (Linux and most Unixes)."""
     try:
-        with open("/proc/uptime", "r", encoding="ascii") as handle:
+        with open("/proc/uptime", encoding="ascii") as handle:
             uptime_seconds = float(handle.readline().split()[0])
         return time.time() - uptime_seconds
     except (OSError, ValueError, IndexError):
@@ -104,7 +129,7 @@ def _boot_time_windows() -> float | None:
         import ctypes
 
         # GetTickCount64 returns milliseconds since the system started.
-        millis = ctypes.windll.kernel32.GetTickCount64()  # type: ignore[attr-defined]
+        millis = int(ctypes.windll.kernel32.GetTickCount64())  # type: ignore[attr-defined]
         return time.time() - millis / 1000.0
     except (OSError, AttributeError):
         return None

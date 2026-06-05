@@ -9,11 +9,16 @@ so name generation never hard-fails.
 from __future__ import annotations
 
 import random
+from typing import Callable
 
 __all__ = ["funny_name"]
 
+# coolname's slug generator, or ``None`` when the dependency is unavailable.
+_generate_slug: Callable[[int], str] | None
 try:
-    from coolname import generate_slug as _generate_slug
+    import coolname
+
+    _generate_slug = coolname.generate_slug
 except ImportError:  # pragma: no cover - exercised only without the dependency
     _generate_slug = None
 

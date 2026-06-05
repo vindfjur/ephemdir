@@ -36,17 +36,17 @@ class Registry:
         self.path = path or (user_data_dir() / "registry.json")
         self._lock_path = self.path.with_suffix(self.path.suffix + ".lock")
 
-    def load(self) -> Dict[str, Entry]:
+    def load(self) -> dict[str, Entry]:
         """Return the registry contents, or an empty mapping if absent/corrupt."""
         try:
-            with open(self.path, "r", encoding="utf-8") as handle:
+            with open(self.path, encoding="utf-8") as handle:
                 data = json.load(handle)
         except (FileNotFoundError, json.JSONDecodeError):
             return {}
         # Be defensive: ignore anything that is not the expected shape.
         return data if isinstance(data, dict) else {}
 
-    def save(self, state: Dict[str, Entry]) -> None:
+    def save(self, state: dict[str, Entry]) -> None:
         """Atomically persist ``state`` to disk."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
@@ -57,7 +57,7 @@ class Registry:
         os.replace(tmp_path, self.path)
 
     @contextmanager
-    def transaction(self) -> Iterator[Dict[str, Entry]]:
+    def transaction(self) -> Iterator[dict[str, Entry]]:
         """Lock, yield a mutable copy of the state, then save it on exit.
 
         Usage::
