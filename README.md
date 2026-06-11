@@ -65,6 +65,20 @@ d.created_at    # creation timestamp
 d.expires_at    # expiry timestamp or None
 d.remove()      # delete now and stop tracking
 d.keep()        # stop tracking but keep on disk (becomes permanent)
+d.extend("2h")  # fresh lifetime counted from now (None = no time limit)
+```
+
+You can also manage any tracked directory later — by full path, exact name or
+a unique prefix of the name:
+
+```python
+from ephemdir import keep, extend, remove, resolve, prune
+
+keep("brave-otter")          # liked it? make it permanent
+extend("brave-otter", "2h")  # give it two more hours from now
+remove("brave-otter")        # delete it right away
+resolve("bra")               # -> Path to the matching tracked directory
+prune()                      # forget entries whose dirs were deleted manually
 ```
 
 ## How cleanup works
@@ -115,26 +129,78 @@ These apply to any option you do not pass explicitly to `tempdir()` or the
 `ephemdir new` command. Reading the file uses the standard-library `tomllib`
 (Python 3.11+) or `tomli` on older versions.
 
+The environment variables `EPHEMDIR_DATA_DIR` (registry location) and
+`EPHEMDIR_CONFIG_DIR` (config location) override the platform defaults —
+handy for sandboxes, tests and dotfile-managed setups.
+
 ## Command-line interface
 
 ```bash
 ephemdir new                     # create a directory, print its path
 ephemdir new --lifetime 2h       # with a lifetime
 ephemdir new --keep-on-restart   # do not remove on restart
-ephemdir list                    # show tracked directories
+ephemdir list                    # tracked directories, status and time left
+ephemdir path brave-otter        # print a tracked directory's path
+ephemdir keep brave-otter        # liked it? stop tracking, keep forever
+ephemdir extend brave-otter 2h   # fresh lifetime from now (--forever: no limit)
+ephemdir rm brave-otter          # remove a tracked directory now
 ephemdir sweep                   # remove everything due now
 ephemdir sweep --force           # remove every tracked directory
+ephemdir prune                   # forget entries deleted outside ephemdir
 ephemdir watch                   # sweep periodically in the foreground
 ephemdir install-service         # schedule sweeps via the OS scheduler
 ephemdir uninstall-service       # remove the scheduled service
 ```
 
-Add `-v` for more output or `-q` to stay quiet. The `new` command prints the
-path to **stdout** and all diagnostics to **stderr**, so it composes cleanly:
+Every command that takes a directory accepts a full path, the exact name or a
+unique prefix (`bra` for `brave-otter`). Add `-v` for more output or `-q` to
+stay quiet.
+
+### Listing with time left
+
+`ephemdir list` shows each directory's status at a glance:
+
+```
+🟢 spotted-armadillo   1h 59m left              ~/work/spotted-armadillo
+🟡 vermilion-mackerel  4m 59s left              ~/work/vermilion-mackerel
+🔄 caped-dodo          until restart            ~/work/caped-dodo
+🔴 furious-caiman      expired 5m ago           ~/work/furious-caiman
+👻 lucky-yak           gone (deleted manually)  ~/work/lucky-yak
+```
+
+`🟢` counting down · `🟡` less than 15 minutes left · `🔴` due on the next
+sweep · `🔄` until restart · `📌` no auto-cleanup · `👻` deleted outside
+ephemdir (the entry is dropped automatically). Terminals without emoji support
+fall back to ASCII tags; `--plain` forces them, `--json` prints
+machine-readable output for scripting.
+
+### Jumping into directories (`ecd` / `enew`)
+
+A subprocess cannot change your shell's working directory, so ephemdir ships
+shell functions instead (the same trick `zoxide` and `nvm` use). Add one line
+to your shell rc file:
 
 ```bash
-cd "$(ephemdir new)"
+# ~/.bashrc or ~/.zshrc
+eval "$(ephemdir shell-init)"
+
+# ~/.config/fish/config.fish
+ephemdir shell-init fish | source
+
+# PowerShell $PROFILE
+Invoke-Expression (& ephemdir shell-init powershell | Out-String)
 ```
+
+Then:
+
+```bash
+enew -l 2h        # create a directory and cd into it
+ecd brave-otter   # cd into a tracked directory by name or prefix
+ecd               # cd into the most recently created one
+```
+
+The `new` and `path` commands print the path to **stdout** and all diagnostics
+to **stderr**, so they also compose cleanly by hand: `cd "$(ephemdir new)"`.
 
 ## Development
 

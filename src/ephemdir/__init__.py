@@ -14,19 +14,42 @@ Basic usage::
 
     with tempdir() as work:          # removed automatically on block exit
         ...
+
+Managing directories later (by name, unique prefix or path)::
+
+    from ephemdir import keep, extend, remove
+
+    keep("brave-otter")              # make it permanent
+    extend("brave-otter", "2h")      # fresh lifetime from now
+    remove("brave-otter")            # delete it right away
 """
 
 from __future__ import annotations
 
-from .core import EphemeralDirectory, registered, sweep, tempdir
+from .core import (
+    EphemeralDirectory,
+    extend,
+    keep,
+    prune,
+    registered,
+    remove,
+    resolve,
+    sweep,
+    tempdir,
+)
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __author__ = "vindfjur"
 
 __all__ = [
     "tempdir",
     "sweep",
     "registered",
+    "keep",
+    "extend",
+    "remove",
+    "resolve",
+    "prune",
     "EphemeralDirectory",
     "__version__",
     "__author__",
