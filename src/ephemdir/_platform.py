@@ -29,8 +29,14 @@ def user_data_dir(app_name: str = "ephemdir") -> Path:
     * macOS:   ``~/Library/Application Support/<app_name>``
     * Linux:   ``$XDG_DATA_HOME/<app_name>`` or ``~/.local/share/<app_name>``
 
-    The directory is created if it does not exist.
+    ``EPHEMDIR_DATA_DIR`` overrides the platform location entirely (useful for
+    tests and sandboxed setups). The directory is created if it does not exist.
     """
+    override = os.environ.get("EPHEMDIR_DATA_DIR")
+    if override:
+        path = Path(override)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
         root = Path(base) if base else Path.home() / "AppData" / "Local"
@@ -54,8 +60,14 @@ def user_config_dir(app_name: str = "ephemdir") -> Path:
     * macOS:   ``~/Library/Application Support/<app_name>``
     * Linux:   ``$XDG_CONFIG_HOME/<app_name>`` or ``~/.config/<app_name>``
 
-    The directory is created if it does not exist.
+    ``EPHEMDIR_CONFIG_DIR`` overrides the platform location entirely. The
+    directory is created if it does not exist.
     """
+    override = os.environ.get("EPHEMDIR_CONFIG_DIR")
+    if override:
+        path = Path(override)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
     if sys.platform == "win32":
         base = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
         root = Path(base) if base else Path.home() / "AppData" / "Roaming"

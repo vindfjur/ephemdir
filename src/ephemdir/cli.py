@@ -2,26 +2,115 @@
 
 Exposes the library through a small ``ephemdir`` command:
 
-* ``ephemdir new``    -- create a new ephemeral directory and print its path
-* ``ephemdir sweep``  -- remove every directory that is due for cleanup
-* ``ephemdir list``   -- show all tracked directories
-* ``ephemdir watch``  -- run a foreground loop that sweeps periodically
+* ``ephemdir new``        -- create a new ephemeral directory and print its path
+* ``ephemdir list``       -- show tracked directories with status and time left
+* ``ephemdir path``       -- print the path of a tracked directory by name
+* ``ephemdir keep``       -- stop tracking a directory (make it permanent)
+* ``ephemdir extend``     -- give a directory a fresh lifetime
+* ``ephemdir rm``         -- remove a tracked directory now
+* ``ephemdir sweep``      -- remove every directory that is due for cleanup
+* ``ephemdir prune``      -- forget entries whose directories were deleted manually
+* ``ephemdir watch``      -- run a foreground loop that sweeps periodically
+* ``ephemdir shell-init`` -- print shell functions (``ecd``, ``enew``) to eval
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import os
 import sys
 import time
 from datetime import datetime
-from typing import Any, Sequence
+from pathlib import Path
+from typing import Any, Sequence, TextIO
 
 from . import __version__
+from ._platform import boot_time
+from ._registry import Entry
 from ._service import install_service, uninstall_service
-from .core import _UNSET, registered, sweep, tempdir
+from .core import (
+    _UNSET,
+    dir_status,
+    extend,
+    keep,
+    prune,
+    registered,
+    remove,
+    resolve,
+    sweep,
+    tempdir,
+)
 
 logger = logging.getLogger("ephemdir")
+
+# Status icons for `ephemdir list`, with an ASCII fallback for terminals whose
+# encoding cannot represent emoji (e.g. some Windows consoles).
+_ICONS = {
+    "active": "🟢",
+    "expiring": "🟡",
+    "expired": "🔴",
+    "until-restart": "🔄",
+    "kept": "📌",
+    "missing": "👻",
+}
+_ASCII_ICONS = {
+    "active": "[ok]  ",
+    "expiring": "[soon]",
+    "expired": "[due] ",
+    "until-restart": "[boot]",
+    "kept": "[pin] ",
+    "missing": "[gone]",
+}
+
+# Shell snippets emitted by `ephemdir shell-init`. A subprocess cannot change
+# its parent shell's working directory, so navigation has to be a function
+# defined in the user's shell -- the same technique zoxide and nvm use.
+_POSIX_SNIPPET = """\
+# ephemdir shell integration -- add to your shell rc file:
+#   eval "$(ephemdir shell-init)"
+ecd() {
+    local target
+    target="$(command ephemdir path "$@")" || return 1
+    cd "$target" || return 1
+}
+enew() {
+    local target
+    target="$(command ephemdir new "$@")" || return 1
+    cd "$target" || return 1
+}
+"""
+_FISH_SNIPPET = """\
+# ephemdir shell integration -- add to ~/.config/fish/config.fish:
+#   ephemdir shell-init fish | source
+function ecd --description "cd into a tracked ephemeral directory"
+    set -l target (command ephemdir path $argv); or return 1
+    cd $target
+end
+function enew --description "create an ephemeral directory and cd into it"
+    set -l target (command ephemdir new $argv); or return 1
+    cd $target
+end
+"""
+_POWERSHELL_SNIPPET = """\
+# ephemdir shell integration -- add to your PowerShell $PROFILE:
+#   Invoke-Expression (& ephemdir shell-init powershell | Out-String)
+function ecd {
+    $target = ephemdir path @args
+    if ($LASTEXITCODE -eq 0 -and $target) { Set-Location $target }
+}
+function enew {
+    $target = ephemdir new @args
+    if ($LASTEXITCODE -eq 0 -and $target) { Set-Location $target }
+}
+"""
+_SHELL_SNIPPETS = {
+    "bash": _POSIX_SNIPPET,
+    "zsh": _POSIX_SNIPPET,
+    "fish": _FISH_SNIPPET,
+    "powershell": _POWERSHELL_SNIPPET,
+}
 
 
 def _configure_logging(verbosity: int, quiet: bool) -> None:
@@ -37,7 +126,9 @@ def _configure_logging(verbosity: int, quiet: bool) -> None:
         level = logging.INFO
     else:
         level = logging.WARNING
-    logging.basicConfig(level=level, format="%(message)s", stream=sys.stderr)
+    # force=True rebinds the handler to the current sys.stderr on every run,
+    # so repeated main() calls (tests, REPL) never log to a stale stream.
+    logging.basicConfig(level=level, format="%(message)s", stream=sys.stderr, force=True)
 
 
 def _format_timestamp(value: object) -> str:
@@ -45,6 +136,54 @@ def _format_timestamp(value: object) -> str:
     if not isinstance(value, (int, float)):
         return "never"
     return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _format_duration(seconds: float) -> str:
+    """Humanize a duration: ``"1d 4h"``, ``"1h 23m"``, ``"5m 12s"``, ``"42s"``.
+
+    At most the two largest non-zero units are shown.
+    """
+    total = max(0, int(seconds))
+    components = [("d", total // 86400), ("h", total % 86400 // 3600),
+                  ("m", total % 3600 // 60), ("s", total % 60)]
+    nonzero = [(unit, value) for unit, value in components if value]
+    if not nonzero:
+        return "0s"
+    return " ".join(f"{value}{unit}" for unit, value in nonzero[:2])
+
+
+def _status_note(status: str, entry: Entry, now: float) -> str:
+    """One short human phrase describing what happens to the directory next."""
+    if status == "missing":
+        return "gone (deleted manually)"
+    if status == "kept":
+        return "no auto-cleanup"
+    if status == "until-restart":
+        return "until restart"
+    expires_at = entry.get("expires_at")
+    if status == "expired":
+        if isinstance(expires_at, (int, float)) and now >= float(expires_at):
+            return f"expired {_format_duration(now - float(expires_at))} ago"
+        return "due now (machine restarted)"
+    # active / expiring
+    if isinstance(expires_at, (int, float)):
+        return f"{_format_duration(float(expires_at) - now)} left"
+    return "tracked"
+
+
+def _supports_emoji(stream: TextIO) -> bool:
+    """Return ``True`` when ``stream`` can encode the status emoji."""
+    encoding = getattr(stream, "encoding", None) or ""
+    try:
+        "🟢".encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return False
+    return True
+
+
+def _created_at(entry: Entry) -> float:
+    value = entry.get("created_at")
+    return float(value) if isinstance(value, (int, float)) else 0.0
 
 
 def _cmd_new(args: argparse.Namespace) -> int:
@@ -79,13 +218,120 @@ def _cmd_sweep(args: argparse.Namespace) -> int:
 
 def _cmd_list(args: argparse.Namespace) -> int:
     state = registered()
-    if not state:
+    now = time.time()
+    current_boot = boot_time()
+
+    rows = []
+    for path_str, entry in state.items():
+        path = Path(path_str)
+        status = dir_status(entry, path, now, current_boot)
+        rows.append((path, entry, status))
+    rows.sort(key=lambda row: (_created_at(row[1]), str(row[0])))
+
+    if args.json:
+        payload = []
+        for path, entry, status in rows:
+            expires_at = entry.get("expires_at")
+            remaining = (
+                float(expires_at) - now if isinstance(expires_at, (int, float)) else None
+            )
+            payload.append(
+                {
+                    "path": str(path),
+                    "name": path.name,
+                    "status": status,
+                    "exists": status != "missing",
+                    "created_at": entry.get("created_at"),
+                    "expires_at": expires_at,
+                    "remaining_seconds": remaining,
+                    "remove_on_restart": bool(entry.get("remove_on_restart")),
+                    "keep_while_in_use": bool(entry.get("keep_while_in_use")),
+                }
+            )
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    if not rows:
         logger.warning("no tracked directories")
         return 0
-    for path, entry in sorted(state.items()):
-        expires = _format_timestamp(entry.get("expires_at"))
-        restart = "yes" if entry.get("remove_on_restart") else "no"
-        print(f"{path}\n    expires: {expires}    remove-on-restart: {restart}")
+
+    icons = _ICONS if not args.plain and _supports_emoji(sys.stdout) else _ASCII_ICONS
+    name_width = max(len(path.name) for path, _, _ in rows)
+    notes = [_status_note(status, entry, now) for _, entry, status in rows]
+    note_width = max(len(note) for note in notes)
+    for (path, _, status), note in zip(rows, notes):
+        print(f"{icons[status]} {path.name:<{name_width}}  {note:<{note_width}}  {path}")
+    return 0
+
+
+def _cmd_path(args: argparse.Namespace) -> int:
+    try:
+        if args.target is None:
+            path = _latest_tracked()
+        else:
+            path = resolve(args.target)
+    except LookupError as error:
+        logger.error("%s", error)
+        return 1
+    print(path)
+    return 0
+
+
+def _latest_tracked() -> Path:
+    """Return the most recently created tracked directory that still exists."""
+    state = registered()
+    live = [
+        (_created_at(entry), key) for key, entry in state.items() if Path(key).exists()
+    ]
+    if not live:
+        raise LookupError("no tracked directories")
+    live.sort()
+    return Path(live[-1][1])
+
+
+def _cmd_keep(args: argparse.Namespace) -> int:
+    try:
+        path = keep(args.target)
+    except LookupError as error:
+        logger.error("%s", error)
+        return 1
+    logger.warning("kept %s -- it will not be auto-removed", path)
+    print(path)
+    return 0
+
+
+def _cmd_extend(args: argparse.Namespace) -> int:
+    if args.lifetime is None and not args.forever:
+        logger.error("specify a lifetime (e.g. 2h) or --forever")
+        return 2
+    if args.lifetime is not None and args.forever:
+        logger.error("--forever cannot be combined with a lifetime")
+        return 2
+    try:
+        path = extend(args.target, None if args.forever else args.lifetime)
+    except (LookupError, ValueError) as error:
+        logger.error("%s", error)
+        return 1
+    if args.forever:
+        logger.warning("extended %s -- no time limit (restart policy still applies)", path)
+    else:
+        logger.warning("extended %s by %s from now", path, args.lifetime)
+    return 0
+
+
+def _cmd_rm(args: argparse.Namespace) -> int:
+    try:
+        path = remove(args.target)
+    except LookupError as error:
+        logger.error("%s", error)
+        return 1
+    logger.warning("removed %s", path)
+    return 0
+
+
+def _cmd_prune(args: argparse.Namespace) -> int:
+    count = prune()
+    logger.warning("pruned %d stale entr%s", count, "y" if count == 1 else "ies")
     return 0
 
 
@@ -98,6 +344,20 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         logger.warning("stopped")
     return 0
+
+
+def _cmd_shell_init(args: argparse.Namespace) -> int:
+    shell = args.shell or _detect_shell()
+    print(_SHELL_SNIPPETS[shell], end="")
+    return 0
+
+
+def _detect_shell() -> str:
+    """Guess the user's shell from the environment; default to bash."""
+    if sys.platform == "win32":
+        return "powershell"
+    name = Path(os.environ.get("SHELL", "")).name
+    return name if name in _SHELL_SNIPPETS else "bash"
 
 
 def _cmd_install_service(args: argparse.Namespace) -> int:
@@ -139,18 +399,57 @@ def build_parser() -> argparse.ArgumentParser:
                      help="words in the generated name (default: 2)")
     new.set_defaults(func=_cmd_new)
 
+    list_cmd = sub.add_parser("list", help="show tracked directories with time left")
+    list_cmd.add_argument("--json", action="store_true",
+                          help="machine-readable output for scripting")
+    list_cmd.add_argument("--plain", action="store_true",
+                          help="use ASCII status tags instead of emoji")
+    list_cmd.set_defaults(func=_cmd_list)
+
+    path_cmd = sub.add_parser(
+        "path", help="print the path of a tracked directory (by name, prefix or path)")
+    path_cmd.add_argument("target", nargs="?", default=None,
+                          help="directory name, unique prefix or path "
+                               "(default: most recently created)")
+    path_cmd.set_defaults(func=_cmd_path)
+
+    keep_cmd = sub.add_parser(
+        "keep", help="stop tracking a directory so it is never auto-removed")
+    keep_cmd.add_argument("target", help="directory name, unique prefix or path")
+    keep_cmd.set_defaults(func=_cmd_keep)
+
+    extend_cmd = sub.add_parser("extend", help="give a directory a fresh lifetime from now")
+    extend_cmd.add_argument("target", help="directory name, unique prefix or path")
+    extend_cmd.add_argument("lifetime", nargs="?", default=None,
+                            help='new time to live, e.g. "2h" or "1d"')
+    extend_cmd.add_argument("--forever", action="store_true",
+                            help="remove the time limit (restart policy still applies)")
+    extend_cmd.set_defaults(func=_cmd_extend)
+
+    rm = sub.add_parser("rm", help="remove a tracked directory now")
+    rm.add_argument("target", help="directory name, unique prefix or path")
+    rm.set_defaults(func=_cmd_rm)
+
     sweep_cmd = sub.add_parser("sweep", help="remove directories that are due for cleanup")
     sweep_cmd.add_argument("--force", action="store_true",
                            help="remove every tracked directory regardless of policy")
     sweep_cmd.set_defaults(func=_cmd_sweep)
 
-    list_cmd = sub.add_parser("list", help="show all tracked directories")
-    list_cmd.set_defaults(func=_cmd_list)
+    prune_cmd = sub.add_parser(
+        "prune", help="forget entries whose directories were deleted manually")
+    prune_cmd.set_defaults(func=_cmd_prune)
 
     watch = sub.add_parser("watch", help="sweep periodically in the foreground")
     watch.add_argument("--interval", type=int, default=600,
                        help="seconds between sweeps (default: 600)")
     watch.set_defaults(func=_cmd_watch)
+
+    shell_init = sub.add_parser(
+        "shell-init",
+        help="print shell functions (ecd, enew) for cd-ing into directories")
+    shell_init.add_argument("shell", nargs="?", choices=sorted(_SHELL_SNIPPETS),
+                            default=None, help="shell to target (default: autodetect)")
+    shell_init.set_defaults(func=_cmd_shell_init)
 
     install = sub.add_parser("install-service",
                              help="install a scheduled sweep service for this platform")

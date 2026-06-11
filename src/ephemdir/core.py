@@ -18,7 +18,18 @@ from ._naming import funny_name
 from ._platform import boot_time, same_boot
 from ._registry import Entry, Registry
 
-__all__ = ["EphemeralDirectory", "tempdir", "sweep", "registered"]
+__all__ = [
+    "EphemeralDirectory",
+    "tempdir",
+    "sweep",
+    "registered",
+    "keep",
+    "extend",
+    "remove",
+    "resolve",
+    "prune",
+    "dir_status",
+]
 
 logger = logging.getLogger("ephemdir")
 
@@ -43,6 +54,10 @@ Lifetime = Union[int, float, str, timedelta, None]
 
 # Maximum attempts to find a free, unique directory name before giving up.
 _MAX_NAME_ATTEMPTS = 100
+
+# A directory expiring within this window is reported as "expiring" by
+# :func:`dir_status`, so UIs can highlight it before it disappears.
+_EXPIRING_SOON_SECONDS = 15 * 60
 
 _DURATION_PATTERN = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>[a-zµ]+)", re.IGNORECASE)
 _DURATION_UNITS = {
@@ -178,6 +193,20 @@ class EphemeralDirectory:
         self._unregister()
         logger.info("released ephemeral directory %s (kept on disk)", self._path)
 
+    def extend(self, lifetime: Lifetime = None) -> None:
+        """Give the directory a fresh lifetime counted from now.
+
+        ``None`` removes the time limit; the restart policy still applies.
+        """
+        seconds = parse_lifetime(lifetime)
+        expires_at = time.time() + seconds if seconds is not None else None
+        with self._registry.transaction() as state:
+            entry = state.get(str(self._path))
+            if entry is not None:
+                entry["expires_at"] = expires_at
+        self._expires_at = expires_at
+        logger.info("extended ephemeral directory %s", self._path)
+
     def _unregister(self) -> None:
         key = str(self._path)
         with self._registry.transaction() as state:
@@ -246,7 +275,12 @@ def tempdir(
 
     expires_seconds = parse_lifetime(settings["lifetime"])
     parent_value = settings["parent"]
-    parent_path = Path(parent_value) if parent_value is not None else Path.cwd()
+    # Normalize to an absolute path: the registry key must stay valid no matter
+    # which working directory a later sweep runs from.
+    if parent_value is not None:
+        parent_path = Path(os.path.abspath(Path(parent_value).expanduser()))
+    else:
+        parent_path = Path.cwd()
     parent_path.mkdir(parents=True, exist_ok=True)
 
     path = _create_unique_dir(parent_path, settings["prefix"], settings["words"])
@@ -308,15 +342,18 @@ def sweep(*, registry: Registry | None = None, force: bool = False) -> int:
     now = time.time()
     current_boot = boot_time()
     removed = 0
+    stale = 0
 
     with reg.transaction() as state:
         for key in list(state.keys()):
             entry = state[key]
             path = Path(key)
 
-            # Drop entries whose directory has already disappeared.
+            # Drop entries whose directory has already disappeared, e.g.
+            # because the user deleted it manually before we got to it.
             if not path.exists():
                 del state[key]
+                stale += 1
                 continue
 
             if not (force or _is_due(entry, now, current_boot)):
@@ -337,6 +374,12 @@ def sweep(*, registry: Registry | None = None, force: bool = False) -> int:
                 # Locked (e.g. an open file on Windows): keep tracking and retry.
                 logger.info("deferring locked ephemeral directory %s", path)
 
+    if stale:
+        logger.info(
+            "dropped %d stale entr%s (directories deleted outside ephemdir)",
+            stale,
+            "y" if stale == 1 else "ies",
+        )
     return removed
 
 
@@ -344,6 +387,141 @@ def registered(*, registry: Registry | None = None) -> dict[str, Entry]:
     """Return a snapshot of all currently tracked directories."""
     reg = registry or Registry()
     return reg.load()
+
+
+def resolve(target: str | os.PathLike[str], *, registry: Registry | None = None) -> Path:
+    """Resolve ``target`` to the path of a tracked directory.
+
+    ``target`` may be a path (absolute or relative), the exact name of a
+    tracked directory (``brave-otter``), or a unique prefix of one (``bra``).
+
+    Raises :class:`LookupError` when nothing matches, when the match is
+    ambiguous, or when the matched directory no longer exists on disk (in that
+    case the stale registry entry is dropped as a side effect).
+    """
+    reg = registry or Registry()
+    state = reg.load()
+    text = os.fspath(target)
+
+    # 1. A path that points at a tracked directory.
+    candidate = Path(os.path.abspath(Path(text).expanduser()))
+    if str(candidate) in state:
+        matches = [candidate]
+    else:
+        tracked = [Path(key) for key in state]
+        # 2. Exact directory name, then 3. unique name prefix.
+        matches = [p for p in tracked if p.name == text]
+        if not matches:
+            matches = [p for p in tracked if p.name.startswith(text)]
+
+    if not matches:
+        raise LookupError(f"no tracked directory matches {text!r}")
+    if len(matches) > 1:
+        names = ", ".join(sorted(p.name for p in matches))
+        raise LookupError(f"{text!r} is ambiguous; it matches: {names}")
+
+    path = matches[0]
+    if not path.exists():
+        # Deleted manually before us: drop the stale entry and say so clearly.
+        with reg.transaction() as live:
+            live.pop(str(path), None)
+        raise LookupError(
+            f"{path} was tracked but no longer exists "
+            "(deleted outside ephemdir); the stale entry has been removed"
+        )
+    return path
+
+
+def keep(target: str | os.PathLike[str], *, registry: Registry | None = None) -> Path:
+    """Stop tracking a directory without deleting it; return its path.
+
+    The directory becomes permanent as far as ephemdir is concerned — it will
+    never be auto-removed. ``target`` accepts anything :func:`resolve` does.
+    """
+    reg = registry or Registry()
+    path = resolve(target, registry=reg)
+    with reg.transaction() as state:
+        state.pop(str(path), None)
+    logger.info("kept %s (no longer tracked)", path)
+    return path
+
+
+def extend(
+    target: str | os.PathLike[str],
+    lifetime: Lifetime = None,
+    *,
+    registry: Registry | None = None,
+) -> Path:
+    """Give a tracked directory a fresh lifetime counted from now.
+
+    ``None`` removes the time limit entirely (the restart policy still
+    applies). Returns the directory's path.
+    """
+    reg = registry or Registry()
+    path = resolve(target, registry=reg)
+    seconds = parse_lifetime(lifetime)
+    expires_at = time.time() + seconds if seconds is not None else None
+    with reg.transaction() as state:
+        entry = state.get(str(path))
+        if entry is None:
+            # The entry vanished between resolve() and here (e.g. a concurrent
+            # sweep); surface it the same way as an unknown target.
+            raise LookupError(f"no tracked directory matches {os.fspath(target)!r}")
+        entry["expires_at"] = expires_at
+    logger.info("extended %s", path)
+    return path
+
+
+def remove(target: str | os.PathLike[str], *, registry: Registry | None = None) -> Path:
+    """Delete a tracked directory now and stop tracking it; return its path."""
+    reg = registry or Registry()
+    path = resolve(target, registry=reg)
+    if not _delete_tree(path):
+        # Explicit removal: best-effort delete even when the atomic rename
+        # failed (e.g. a locked file on Windows).
+        shutil.rmtree(path, ignore_errors=True)
+    with reg.transaction() as state:
+        state.pop(str(path), None)
+    logger.info("removed %s", path)
+    return path
+
+
+def prune(*, registry: Registry | None = None) -> int:
+    """Drop registry entries whose directories were deleted outside ephemdir.
+
+    Returns the number of stale entries removed. Sweeps do this automatically;
+    ``prune`` only tidies the registry without deleting anything from disk.
+    """
+    reg = registry or Registry()
+    pruned = 0
+    with reg.transaction() as state:
+        for key in list(state.keys()):
+            if not Path(key).exists():
+                del state[key]
+                pruned += 1
+    if pruned:
+        logger.info("pruned %d stale entr%s", pruned, "y" if pruned == 1 else "ies")
+    return pruned
+
+
+def dir_status(entry: Entry, path: Path, now: float, current_boot: float | None) -> str:
+    """Classify a registry entry for display purposes.
+
+    Returns one of ``"missing"`` (deleted outside ephemdir), ``"expired"``
+    (due for cleanup on the next sweep), ``"expiring"`` (less than
+    15 minutes left), ``"active"`` (counting down), ``"until-restart"``
+    (no time limit, removed on reboot) or ``"kept"`` (no time limit and
+    survives reboots).
+    """
+    if not path.exists():
+        return "missing"
+    if _is_due(entry, now, current_boot):
+        return "expired"
+    expires_at = entry.get("expires_at")
+    if isinstance(expires_at, (int, float)):
+        remaining = float(expires_at) - now
+        return "expiring" if remaining <= _EXPIRING_SOON_SECONDS else "active"
+    return "until-restart" if entry.get("remove_on_restart") else "kept"
 
 
 def _is_due(entry: Entry, now: float, current_boot: float | None) -> bool:
