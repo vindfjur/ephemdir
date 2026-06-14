@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from ephemdir._registry import Registry
 from ephemdir.cli import _format_duration, main
 
 
@@ -43,6 +44,16 @@ def test_list_marks_manually_deleted(capsys, tmp_path):
     out = capsys.readouterr().out
     assert "[gone]" in out
     assert "deleted manually" in out
+
+
+def test_list_marks_replaced_directory(capsys, tmp_path):
+    created = _create(capsys, tmp_path)
+    shutil.rmtree(created)
+    Path(created).mkdir()  # another directory took the path
+    assert main(["list", "--plain"]) == 0
+    out = capsys.readouterr().out
+    assert "[warn]" in out
+    assert "will not be touched" in out
 
 
 def test_list_json(capsys, tmp_path):
@@ -123,6 +134,32 @@ def test_prune_forgets_deleted_directories(capsys, tmp_path):
     assert main(["prune"]) == 0
     assert main(["list", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == []
+
+
+def test_recover_forget_untracks_without_touching_paths(capsys, tmp_path):
+    created = Path(_create(capsys, tmp_path))
+    staging = created.parent / f".{created.name}.123-abcdef12.deleting"
+    staging.mkdir()
+    (staging / "mystery.txt").write_text("keep")
+    registry = Registry()
+    with registry.transaction() as state:
+        state[str(created)].update(
+            {"state": "recovery", "claim_id": None, "staging_path": str(staging)}
+        )
+
+    assert main(["recover", created.name, "--forget"]) == 0
+    result = capsys.readouterr()
+    assert str(created) in result.err
+    assert "no files were deleted" in result.err
+    assert created.is_dir()
+    assert (staging / "mystery.txt").read_text() == "keep"
+    assert main(["list", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == []
+
+
+def test_watch_rejects_nonpositive_interval(capsys):
+    assert main(["watch", "--interval", "0"]) == 2
+    assert "must be >= 1" in capsys.readouterr().err
 
 
 def test_shell_init_posix(capsys):

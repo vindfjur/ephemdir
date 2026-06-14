@@ -43,18 +43,21 @@ def test_locked_directory_is_deferred_without_partial_delete(tmp_path, registry,
     # its contents must survive intact, and the entry stays tracked for retry.
     monkeypatch.setattr("ephemdir.core.is_in_use", lambda path: False)
 
-    # Fail only the staging rename in _delete_tree, not the registry's atomic
-    # save (which also uses os.replace).
+    # Fail only the fd-relative staging rename, not registry persistence.
     import os
 
-    real_replace = os.replace
+    real_rename = os.rename
 
-    def _raise(src, dst):
+    def _raise(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
         if ".deleting" in str(dst):
             raise OSError("file is in use")
-        return real_replace(src, dst)
+        return real_rename(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
-    monkeypatch.setattr("ephemdir.core.os.replace", _raise)
+    monkeypatch.setattr("ephemdir.core.os.rename", _raise)
+    monkeypatch.setattr(
+        "ephemdir.core.os.supports_dir_fd",
+        frozenset(set(os.supports_dir_fd) | {_raise}),
+    )
 
     d = tempdir(lifetime="1h", parent=tmp_path, registry=registry)
     (d.path / "open.txt").write_text("still here")
@@ -67,14 +70,14 @@ def test_locked_directory_is_deferred_without_partial_delete(tmp_path, registry,
     assert str(d.path) in registered(registry=registry)  # still tracked
 
 
-def test_delete_tree_is_atomic_on_success(tmp_path):
-    from ephemdir.core import _delete_tree
+def test_successful_sweep_leaves_no_staging_behind(tmp_path, registry, monkeypatch):
+    monkeypatch.setattr("ephemdir.core.is_in_use", lambda path: False)
+    parent = tmp_path / "work"
+    d = tempdir(lifetime="1h", parent=parent, registry=registry)
+    (d.path / "a.txt").write_text("x")
+    _expire(registry, d.path)
 
-    target = tmp_path / "victim"
-    target.mkdir()
-    (target / "a.txt").write_text("x")
-
-    assert _delete_tree(target) is True
-    assert not target.exists()
-    # No leftover staging directories in the parent.
-    assert list(tmp_path.iterdir()) == []
+    assert sweep(registry=registry) == 1
+    assert not d.path.exists()
+    # No leftover .deleting staging directories in the parent.
+    assert list(parent.iterdir()) == []

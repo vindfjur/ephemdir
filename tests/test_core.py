@@ -33,7 +33,21 @@ def test_parse_lifetime(value, expected):
     assert parse_lifetime(value) == expected
 
 
-@pytest.mark.parametrize("bad", ["", "10x", "abc", "-5", -1])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "10x",
+        "abc",
+        "-5",
+        -1,
+        float("nan"),
+        float("inf"),
+        timedelta(seconds=-5),
+        True,
+        "9" * 400 + "h",  # overflows float to infinity
+    ],
+)
 def test_parse_lifetime_rejects_bad_input(bad):
     with pytest.raises((ValueError, TypeError)):
         parse_lifetime(bad)
@@ -95,11 +109,13 @@ def test_sweep_keeps_unexpired(tmp_path, registry):
     assert d.path.is_dir()
 
 
-def test_sweep_removes_on_restart(tmp_path, registry):
+def test_sweep_removes_on_restart(tmp_path, registry, monkeypatch):
+    monkeypatch.setattr("ephemdir.core.boot_session_id", lambda: "current-boot")
     d = tempdir(parent=tmp_path, registry=registry)
-    # Simulate a reboot by rewriting the stored boot time far in the past.
+    # A different stable boot-session id is authoritative and independent of
+    # wall-clock corrections.
     with registry.transaction() as state:
-        state[str(d.path)]["boot_time"] = time.time() - 10_000_000
+        state[str(d.path)]["boot_id"] = "definitely-an-older-boot"
     removed = sweep(registry=registry)
     assert removed == 1
     assert not d.path.exists()
@@ -122,8 +138,27 @@ def test_sweep_force_removes_everything(tmp_path, registry):
 
 
 def test_sweep_drops_vanished_entries(tmp_path, registry):
+    import shutil
+
     d = tempdir(parent=tmp_path, registry=registry)
     # Remove the directory behind ephemdir's back.
-    d.path.rmdir()
+    shutil.rmtree(d.path)
     sweep(registry=registry)
     assert str(d.path) not in registered(registry=registry)
+
+
+
+def test_tempdir_refuses_unsupported_backend_before_side_effects(
+    tmp_path, registry, monkeypatch
+):
+    parent = tmp_path / "work"
+    monkeypatch.setattr(
+        "ephemdir.core._safe_delete_backend_error",
+        lambda: "safe deletion backend unavailable",
+    )
+
+    with pytest.raises(OSError, match="cannot create an ephemeral directory safely"):
+        tempdir(parent=parent, registry=registry)
+
+    assert not parent.exists()
+    assert not registry.path.exists()

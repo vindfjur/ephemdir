@@ -6,16 +6,59 @@
 
 **ephemdir** (*ephemeral directory*) creates temporary directories that clean
 themselves up — automatically removed once their lifetime expires or after the
-machine restarts. Names are playful two-word slugs like `brave-otter` or
-`nimble-marmot` instead of dull ones like `tmp_data`.
+machine restarts. Names are playful two-word slugs with a random token, like
+`brave-otter-a81f42c9d047315b`, instead of dull ones like `tmp_data` — and you
+can address them by any unique prefix (`brave` or `brave-otter`).
 
-Works on **Linux, macOS and Windows** with a single small dependency
-([`coolname`](https://pypi.org/project/coolname/)).
+Supports **Python 3.10+ on Linux and macOS** with safe fd-relative cleanup.
+Windows is intentionally unsupported until Python or a dedicated backend can
+provide handle-bound recursive deletion; `tempdir()` fails before creating
+anything on unsupported platforms. The package has no third-party runtime
+dependencies on Python 3.11+; Python 3.10 uses `tomli` only for TOML
+configuration parsing.
 
 ## Installation
 
+> [!IMPORTANT]
+> Windows is **not supported in ephemdir 0.4.0**. The package may install on
+> Windows, but `tempdir()` and `ephemdir new` fail before creating anything
+> because Python does not expose the safe handle-bound recursive deletion
+> primitives ephemdir requires. Supported platforms are Linux and macOS.
+
+### macOS (Homebrew)
+
+```bash
+brew install vindfjur/tap/ephemdir
+```
+
+Or tap once and install by name:
+
+```bash
+brew tap vindfjur/tap
+brew install ephemdir
+```
+
+### Linux
+
+For command-line use, `pipx` keeps ephemdir isolated from system packages:
+
+```bash
+pipx install ephemdir
+```
+
+Or install from PyPI with pip:
+
 ```bash
 pip install ephemdir
+```
+
+### Python package
+
+Add ephemdir to your project dependencies, or install it into the current
+environment:
+
+```bash
+python -m pip install ephemdir
 ```
 
 ## Quick start
@@ -25,7 +68,7 @@ from ephemdir import tempdir
 
 # Lives until the next system restart (the default).
 work = tempdir()
-print(work)                       # -> /current/dir/brave-otter
+print(work)                       # -> /current/dir/brave-otter-a81f42c9d047315b
 (work.path / "data.txt").write_text("hello")
 
 # Also expires after a given lifetime.
@@ -51,7 +94,7 @@ with tempdir() as scratch:
 | `keep_while_in_use` | `False`       | Defer deletion while files are still open inside (Linux/macOS).   |
 | `parent`            | current dir   | Where to create the directory.                                    |
 | `prefix`            | `""`          | Prefix prepended to the generated name.                           |
-| `words`             | `2`           | Number of words in the generated name.                            |
+| `words`             | `2`           | Number of words in the generated name (a 64-bit random hex token is always appended). |
 
 Any option left unset falls back to the [user config file](#configuration), then
 to the built-in default shown above.
@@ -89,21 +132,103 @@ directory. Cleanup happens in two ways:
 1. **Lazily** — every call to `tempdir()` first sweeps anything already due.
 2. **On demand** — run `ephemdir sweep` from the command line.
 
+### Safety guarantees
+
+ephemdir never auto-deletes a directory it cannot prove it created:
+
+* Each directory contains a hidden **`.ephemdir` marker file** with a random
+  id that is also stored in the registry (plus the inode on Unix). Nothing is
+  auto-deleted unless the marker matches — if you delete a directory manually
+  and something else later appears at the same path, ephemdir leaves it alone
+  (shown as ⚠️ `replaced` in `ephemdir list`). Directories registered by
+  ephemdir ≤ 0.3 have no marker, so they are never auto-removed either: they
+  show as ⚪ `legacy` until you `ephemdir rm` or `ephemdir keep` them.
+* Deletion is **journaled and claimed under locks**: the registry records the
+  intent durably before the directory is renamed away and commits afterwards,
+  every step re-verifies the entry and the marker, and each directory has its
+  own OS-level deletion lock. A concurrent `keep` or `extend` always wins
+  against a running sweep (`keep()` inside a `with tempdir()` block is
+  honoured), two overlapping sweeps never delete the same tree twice, and a
+  crash at any point is reconciled by the next sweep's recovery pass under the
+  same deletion lock. A half-deleted tree stays at its private staging path and
+  is retried; it is never renamed over a new object at the original path.
+  Ambiguous cases are parked as `recovery` and can be handled with
+  `ephemdir recover`. Nothing mid-deletion becomes untracked.
+* On POSIX, recursive staging deletion is bound to the verified directory
+  object: ephemdir opens the staging tree with `O_DIRECTORY | O_NOFOLLOW`,
+  checks `fstat()` against the claimed inode/marker and removes contents via
+  `dir_fd` operations. If the staging pathname is replaced after verification,
+  the replacement is left alone and the entry moves to `recovery`.
+* Linux cleanup refuses to cross mount boundaries by comparing mount ids from
+  opened directory fds. It uses `statx(STATX_MNT_ID)` when available and falls
+  back to `/proc/self/fdinfo` or `/proc/self/mountinfo` on older kernels. Mount
+  capability is checked before claim, then rechecked before recursion.
+* Directory creation and claim/delete require a trusted parent: owner-only
+  parents are accepted, and shared writable parents must have sticky bit set.
+  Group/world-writable parents without sticky bit are refused before rename.
+* Platforms without safe fd-bound recursive deletion do not fall back to
+  pathname-based `rmtree`. `tempdir()` refuses to create new managed directories,
+  and cleanup capability is rechecked before claim so existing entries remain untouched.
+* A **deletion guard** refuses to touch the filesystem root, your home
+  directory or ephemdir's own data — even with `sweep --force` and even if the
+  registry file was corrupted or edited by hand. Malformed registry entries
+  are rejected on load and a corrupt registry is quarantined, not overwritten.
+* Directories are created owner-only (`0700`), like `tempfile.mkdtemp`.
+* Optional `lsof` and macOS `sysctl` probes ignore inherited `PATH`, resolve
+  helpers only from trusted system directories and run with a minimal environment.
+  If `keep_while_in_use` is enabled and `lsof` cannot run, the sweep keeps the
+  directory and warns instead of deleting.
+* Generated names end with a **64-bit random token**, so another local user
+  cannot pre-create the whole name space in a shared sticky directory like
+  `/tmp` and block creation.
+* The scheduled service runs **`python -I -m ephemdir`** from `/` with a
+  scrubbed environment, and `install-service` verifies both that isolated
+  mode resolves `ephemdir` to the installed package and that every directory
+  on the way to the systemd/launchd unit files is owned and writable only by
+  you (service files are then written `dir_fd`-relative to the verified
+  directory).
+* The config file is honoured only when it is yours: a `config.toml` owned by
+  another user or writable by group/others is ignored with a warning.
+
+When an interrupted deletion is genuinely ambiguous, inspect it with
+`ephemdir list --json`. After resolving the filesystem situation, retry it with
+`ephemdir recover <name>`. `ephemdir recover <name> --forget` removes only the
+registry entry and never deletes either the original or staging path.
+
 To clean up reliably over time (and right after a reboot), install a scheduled
 sweep service for your platform — one command, no manual unit files:
 
 ```bash
-ephemdir install-service --interval 600   # launchd / systemd / Task Scheduler
+ephemdir install-service --interval 600   # launchd / systemd
 ephemdir uninstall-service
 ```
+
+`install-service` validates the persistent runtime before writing anything:
+every component of the interpreter and package paths must be owned by you
+(or root) and must not be writable by other users. This deliberately rejects
+**any** group/world-writable component — including sticky directories like
+`/tmp` — so a virtualenv created under `/tmp` cannot host the scheduled
+service even though it is fine for one-off interactive use. Install the venv
+under your home directory instead. It also checks the interpreter-startup
+hooks Python runs before ephemdir is imported (`.pth` files in site-packages,
+`sitecustomize`, `pyvenv.cfg`, and the `tomli` package on Python 3.10).
+
+> **Trust boundary for `install-service`.** The scheduled job runs your Python
+> interpreter unattended and later, as your user. ephemdir verifies its own
+> package, the interpreter, and the startup hooks above, but it cannot
+> exhaustively vet every module a `.pth` file or a runtime dependency
+> might import — that is the same surface as any Python command you run.
+> **Only install the service from a Python environment whose `site-packages`
+> are not writable by other local users** (a normal per-user `pip`/`venv`
+> install satisfies this). On a single-user machine there is nothing extra to
+> do; on a shared multi-user host, ensure the environment is owned by you and
+> not group/world-writable before scheduling sweeps.
 
 Prefer to wire it up yourself? The equivalents are:
 
 * **Linux (cron):** `*/10 * * * * ephemdir sweep`
 * **macOS (launchd):** a `LaunchAgent` running `ephemdir sweep`; template in
   [`packaging/`](packaging/).
-* **Windows (Task Scheduler):** a task running `ephemdir sweep` at logon and on
-  a repeating interval.
 
 You can also keep a foreground watcher running:
 
@@ -114,8 +239,8 @@ ephemdir watch --interval 600
 ## Configuration
 
 Set per-user defaults in a `config.toml` file in your config directory
-(`~/.config/ephemdir/` on Linux, `~/Library/Application Support/ephemdir/` on
-macOS, `%APPDATA%\ephemdir\` on Windows). Every key is optional:
+(`~/.config/ephemdir/` on Linux or `~/Library/Application Support/ephemdir/`
+on macOS). Every key is optional:
 
 ```toml
 lifetime = "6h"
@@ -147,13 +272,16 @@ ephemdir rm brave-otter          # remove a tracked directory now
 ephemdir sweep                   # remove everything due now
 ephemdir sweep --force           # remove every tracked directory
 ephemdir prune                   # forget entries deleted outside ephemdir
+ephemdir recover brave-otter     # retry an interrupted deletion
+ephemdir recover brave-otter --forget  # forget it without deleting files
 ephemdir watch                   # sweep periodically in the foreground
 ephemdir install-service         # schedule sweeps via the OS scheduler
 ephemdir uninstall-service       # remove the scheduled service
 ```
 
 Every command that takes a directory accepts a full path, the exact name or a
-unique prefix (`bra` for `brave-otter`). Add `-v` for more output or `-q` to
+unique prefix (`bra` or `brave-otter` for `brave-otter-a81f42c9d047315b`).
+Add `-v` for more output or `-q` to
 stay quiet.
 
 ### Listing with time left
@@ -170,7 +298,10 @@ stay quiet.
 
 `🟢` counting down · `🟡` less than 15 minutes left · `🔴` due on the next
 sweep · `🔄` until restart · `📌` no auto-cleanup · `👻` deleted outside
-ephemdir (the entry is dropped automatically). Terminals without emoji support
+ephemdir (the entry is dropped automatically) · `⚠️` replaced by another
+directory (never touched) · `⚪` legacy entry from ephemdir ≤ 0.3 (resolve
+with `rm`/`keep`) · `🚧` interrupted deletion requiring `recover` · `❓`
+temporarily inaccessible but still tracked. Terminals without emoji support
 fall back to ASCII tags; `--plain` forces them, `--json` prints
 machine-readable output for scripting.
 
@@ -187,8 +318,6 @@ eval "$(ephemdir shell-init)"
 # ~/.config/fish/config.fish
 ephemdir shell-init fish | source
 
-# PowerShell $PROFILE
-Invoke-Expression (& ephemdir shell-init powershell | Out-String)
 ```
 
 Then:
@@ -208,6 +337,22 @@ to **stderr**, so they also compose cleanly by hand: `cd "$(ephemdir new)"`.
 pip install -e ".[dev]"
 pytest
 ```
+
+## Reproducible source builds
+
+`pyproject.toml` only declares the minimum safe build backend
+(`setuptools>=78.1.1`, which includes the fix for CVE-2025-47273), so a plain
+isolated build resolves whatever backend version is current. To build exactly
+what release CI builds, use the hash-pinned toolchain:
+
+```bash
+python -m pip install --require-hashes -r requirements-build.txt
+python -m build --no-isolation
+```
+
+Release artifacts are produced this way in `.github/workflows/publish.yml`;
+the workflow records SHA-256 hashes of `dist/` right after the build and
+verifies them again after the install smoke test.
 
 ## License
 
