@@ -507,9 +507,13 @@ def _staging_ownership(original: Path, staging: Path, entry: Entry) -> str:
 
     A journaled state alone proves nothing — the staging path must be the
     private sibling derived from the original path AND be confirmed by the
-    marker (while it still exists) or by the inode recorded at claim time. The
-    marker may legitimately be gone after a partial ``rmtree``, which is why
-    the inode is the fallback proof.
+    marker. The inode recorded at claim time is a necessary cross-check but
+    never sufficient on its own: filesystems such as ext4 and tmpfs reuse an
+    inode number the instant the original tree is removed, so a newcomer
+    created at the same private path can inherit the recorded ``(dev, ino)``.
+    When the marker is recorded but gone, the result is therefore ambiguous
+    (``"unverified"``) and recovery parks it rather than deleting a possible
+    replacement.
     """
     if not _valid_staging_path(original, staging):
         return "foreign"
@@ -521,9 +525,11 @@ def _staging_ownership(original: Path, staging: Path, entry: Entry) -> str:
     if isinstance(marker_id, str):
         if marker == marker_id:
             return "ours"
-        if marker is None and inode_ok is True:
-            return "ours"
-        return "foreign"
+        if marker is not None:
+            return "foreign"
+        # Marker recorded but absent: inode-match alone is not proof (inode
+        # reuse), so refuse to claim ownership and let recovery handle it.
+        return "unverified"
     if inode_ok is None:
         return "unverified"
     return "ours"

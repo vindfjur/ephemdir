@@ -10,5 +10,11 @@ pyproject_hooks==1.2.0 \
     --hash=sha256:9e5c6bfa8dcc30091c74b0cf803c81fdd29d94f01992a7707bc97babb1141913
 setuptools==82.0.1 \
     --hash=sha256:a59e362652f08dcd477c78bb6e7bd9d80a7995bc73ce773050228a348ce2e5bb
+# `build` imports tomllib, which is stdlib only on 3.11+; on 3.10 it pulls in
+# tomli. Pinned + hashed here so the 3.10 build job satisfies --require-hashes
+# (the universal py3-none-any wheel plus the sdist cover every 3.10 host).
+tomli==2.4.1 ; python_version < "3.11" \
+    --hash=sha256:0d85819802132122da43cb86656f8d1f8c6587d54ae7dcaf30e90533028b49fe \
+    --hash=sha256:7c7e1a961a0b2f2472c1ac5b69affa0ae1132c39adcb67aba98568702b9cc23f
 wheel==0.47.0 \
     --hash=sha256:212281cab4dff978f6cedd499cd893e1f620791ca6ff7107cf270781e587eced
