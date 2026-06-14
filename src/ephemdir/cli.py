@@ -22,20 +22,23 @@ import logging
 import os
 import sys
 import time
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Sequence, TextIO
+from typing import Any, TextIO
 
 from . import __version__
-from ._platform import boot_time
-from ._registry import Entry
-from ._service import install_service, uninstall_service
+from ._platform import boot_session_id, boot_time
+from ._registry import Entry, UnsafeRegistryError
+from ._service import ServiceError, install_service, uninstall_service
 from .core import (
     _UNSET,
+    _path_state,
     dir_status,
     extend,
     keep,
     prune,
+    recover,
     registered,
     remove,
     resolve,
@@ -54,6 +57,11 @@ _ICONS = {
     "until-restart": "🔄",
     "kept": "📌",
     "missing": "👻",
+    "replaced": "⚠️",
+    "legacy": "⚪",
+    "deleting": "🗑️",
+    "recovery": "🚧",
+    "unavailable": "❓",
 }
 _ASCII_ICONS = {
     "active": "[ok]  ",
@@ -62,6 +70,11 @@ _ASCII_ICONS = {
     "until-restart": "[boot]",
     "kept": "[pin] ",
     "missing": "[gone]",
+    "replaced": "[warn]",
+    "legacy": "[old] ",
+    "deleting": "[del] ",
+    "recovery": "[rec] ",
+    "unavailable": "[n/a] ",
 }
 
 # Shell snippets emitted by `ephemdir shell-init`. A subprocess cannot change
@@ -156,6 +169,16 @@ def _status_note(status: str, entry: Entry, now: float) -> str:
     """One short human phrase describing what happens to the directory next."""
     if status == "missing":
         return "gone (deleted manually)"
+    if status == "replaced":
+        return "replaced by another directory; will not be touched"
+    if status == "legacy":
+        return "from an older ephemdir; use rm or keep to resolve"
+    if status == "deleting":
+        return "partially deleted; sweeps will retry"
+    if status == "recovery":
+        return "interrupted deletion; use ephemdir recover"
+    if status == "unavailable":
+        return "temporarily inaccessible; still tracked"
     if status == "kept":
         return "no auto-cleanup"
     if status == "until-restart":
@@ -203,7 +226,12 @@ def _cmd_new(args: argparse.Namespace) -> int:
     if args.keep_while_in_use is not _UNSET:
         kwargs["keep_while_in_use"] = args.keep_while_in_use
 
-    directory = tempdir(**kwargs)
+    try:
+        directory = tempdir(**kwargs)
+    except (TypeError, ValueError, OSError, LookupError) as error:
+        # Bad user input or an unwritable registry: a message, not a traceback.
+        logger.error("%s", error)
+        return 2
     # The path goes to stdout so it can be captured in shell pipelines;
     # all diagnostics go to stderr via the logger.
     print(directory.path)
@@ -220,11 +248,12 @@ def _cmd_list(args: argparse.Namespace) -> int:
     state = registered()
     now = time.time()
     current_boot = boot_time()
+    current_boot_id = boot_session_id()
 
     rows = []
     for path_str, entry in state.items():
         path = Path(path_str)
-        status = dir_status(entry, path, now, current_boot)
+        status = dir_status(entry, path, now, current_boot, current_boot_id)
         rows.append((path, entry, status))
     rows.sort(key=lambda row: (_created_at(row[1]), str(row[0])))
 
@@ -235,12 +264,20 @@ def _cmd_list(args: argparse.Namespace) -> int:
             remaining = (
                 float(expires_at) - now if isinstance(expires_at, (int, float)) else None
             )
+            staging_value = entry.get("staging_path")
+            staging_path = Path(staging_value) if isinstance(staging_value, str) else None
             payload.append(
                 {
                     "path": str(path),
                     "name": path.name,
                     "status": status,
-                    "exists": status != "missing",
+                    "lifecycle_state": entry.get("state", "active"),
+                    "exists": None if status == "unavailable" else status != "missing",
+                    "original_state": _path_state(path),
+                    "staging_path": str(staging_path) if staging_path is not None else None,
+                    "staging_state": (
+                        _path_state(staging_path) if staging_path is not None else "missing"
+                    ),
                     "created_at": entry.get("created_at"),
                     "expires_at": expires_at,
                     "remaining_seconds": remaining,
@@ -259,7 +296,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
     name_width = max(len(path.name) for path, _, _ in rows)
     notes = [_status_note(status, entry, now) for _, entry, status in rows]
     note_width = max(len(note) for note in notes)
-    for (path, _, status), note in zip(rows, notes):
+    for (path, _, status), note in zip(rows, notes, strict=True):
         print(f"{icons[status]} {path.name:<{name_width}}  {note:<{note_width}}  {path}")
     return 0
 
@@ -281,7 +318,9 @@ def _latest_tracked() -> Path:
     """Return the most recently created tracked directory that still exists."""
     state = registered()
     live = [
-        (_created_at(entry), key) for key, entry in state.items() if Path(key).exists()
+        (_created_at(entry), key)
+        for key, entry in state.items()
+        if entry.get("state", "active") == "active" and _path_state(Path(key)) == "present"
     ]
     if not live:
         raise LookupError("no tracked directories")
@@ -322,10 +361,24 @@ def _cmd_extend(args: argparse.Namespace) -> int:
 def _cmd_rm(args: argparse.Namespace) -> int:
     try:
         path = remove(args.target)
-    except LookupError as error:
+    except (LookupError, OSError) as error:
         logger.error("%s", error)
         return 1
     logger.warning("removed %s", path)
+    return 0
+
+
+def _cmd_recover(args: argparse.Namespace) -> int:
+    action = "forget" if args.forget else "retry"
+    try:
+        path = recover(args.target, action=action)
+    except (LookupError, OSError, ValueError) as error:
+        logger.error("%s", error)
+        return 1
+    if action == "forget":
+        logger.warning("forgot recovery entry for %s; no files were deleted", path)
+    else:
+        logger.warning("reconciled recovery entry for %s", path)
     return 0
 
 
@@ -336,6 +389,9 @@ def _cmd_prune(args: argparse.Namespace) -> int:
 
 
 def _cmd_watch(args: argparse.Namespace) -> int:
+    if args.interval < 1:
+        logger.error("--interval must be >= 1 second")
+        return 2
     logger.warning("watching; sweeping every %d seconds (Ctrl-C to stop)", args.interval)
     try:
         while True:
@@ -361,13 +417,22 @@ def _detect_shell() -> str:
 
 
 def _cmd_install_service(args: argparse.Namespace) -> int:
-    message = install_service(interval=args.interval)
+    try:
+        message = install_service(interval=args.interval)
+    except (ServiceError, ValueError) as error:
+        logger.error("%s", error)
+        return 1
     logger.warning("%s", message)
     return 0
 
 
 def _cmd_uninstall_service(args: argparse.Namespace) -> int:
-    logger.warning("%s", uninstall_service())
+    try:
+        message = uninstall_service()
+    except ServiceError as error:
+        logger.error("%s", error)
+        return 1
+    logger.warning("%s", message)
     return 0
 
 
@@ -439,6 +504,16 @@ def build_parser() -> argparse.ArgumentParser:
         "prune", help="forget entries whose directories were deleted manually")
     prune_cmd.set_defaults(func=_cmd_prune)
 
+    recover_cmd = sub.add_parser(
+        "recover", help="retry or forget an interrupted deletion journal entry")
+    recover_cmd.add_argument("target", help="directory name, unique prefix or original path")
+    recover_cmd.add_argument(
+        "--forget",
+        action="store_true",
+        help="forget the registry entry without deleting original or staging files",
+    )
+    recover_cmd.set_defaults(func=_cmd_recover)
+
     watch = sub.add_parser("watch", help="sweep periodically in the foreground")
     watch.add_argument("--interval", type=int, default=600,
                        help="seconds between sweeps (default: 600)")
@@ -468,7 +543,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     _configure_logging(args.verbose, args.quiet)
-    exit_code: int = args.func(args)
+    try:
+        exit_code: int = args.func(args)
+    except TimeoutError as error:
+        # The registry lock could not be acquired; nothing was modified.
+        logger.error("%s", error)
+        return 1
+    except UnsafeRegistryError as error:
+        # The registry is writable by other users and was left untouched: a
+        # clear message, not a traceback, and definitely no destructive action.
+        logger.error("%s", error)
+        return 1
     return exit_code
 
 

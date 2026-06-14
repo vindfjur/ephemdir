@@ -24,20 +24,25 @@ def _fake_run(stdout: str, returncode: int):
 
 def test_open_file_detected_despite_nonzero_exit(monkeypatch):
     # The real macOS behaviour: a file is listed but lsof exits 1.
+    monkeypatch.setattr(_inuse, "resolve_system_executable", lambda name: "/usr/bin/lsof")
     monkeypatch.setattr(subprocess, "run", _fake_run(f"{_HEADER}\n{_OPEN_FILE}\n", 1))
     assert _inuse._lsof_in_use("/tmp/d") is True
 
 
 def test_no_open_files_reported(monkeypatch):
+    monkeypatch.setattr(_inuse, "resolve_system_executable", lambda name: "/usr/bin/lsof")
     monkeypatch.setattr(subprocess, "run", _fake_run("", 1))
     assert _inuse._lsof_in_use("/tmp/d") is False
 
 
-def test_missing_lsof_is_not_in_use(monkeypatch):
+def test_missing_lsof_reports_unknown(monkeypatch):
+    # A failed probe must say "could not tell" (None), never a confident False:
+    # with keep_while_in_use enabled the sweep then defers instead of deleting.
     def _raise(*args, **kwargs):
         raise FileNotFoundError("lsof")
+    monkeypatch.setattr(_inuse, "resolve_system_executable", lambda name: "/usr/bin/lsof")
     monkeypatch.setattr(subprocess, "run", _raise)
-    assert _inuse._lsof_in_use("/tmp/d") is False
+    assert _inuse._lsof_in_use("/tmp/d") is None
 
 
 @pytest.mark.skipif(_inuse.sys.platform == "win32", reason="lsof is POSIX-only")

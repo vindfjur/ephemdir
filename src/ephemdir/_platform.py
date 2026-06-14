@@ -12,12 +12,15 @@ import sys
 import time
 from pathlib import Path
 
-__all__ = ["user_data_dir", "user_config_dir", "boot_time", "same_boot"]
+from ._trusted_exec import minimal_subprocess_env, resolve_system_executable, stable_subprocess_cwd
+
+__all__ = ["user_data_dir", "user_config_dir", "boot_time", "boot_session_id", "same_boot"]
 
 # Two boot-time readings within this many seconds are treated as the same boot.
-# Boot time derived from uptime can jitter slightly between reads, so we never
-# compare it for exact equality.
-_BOOT_TOLERANCE_SECONDS = 10.0
+# Boot time derived from uptime shifts when the wall clock is stepped (NTP,
+# manual changes), so the tolerance is generous; on Linux the stable
+# kernel boot_id is preferred and this fallback rarely decides anything.
+_BOOT_TOLERANCE_SECONDS = 120.0
 
 
 def user_data_dir(app_name: str = "ephemdir") -> Path:
@@ -35,7 +38,7 @@ def user_data_dir(app_name: str = "ephemdir") -> Path:
     override = os.environ.get("EPHEMDIR_DATA_DIR")
     if override:
         path = Path(override)
-        path.mkdir(parents=True, exist_ok=True)
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
         return path
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
@@ -47,7 +50,8 @@ def user_data_dir(app_name: str = "ephemdir") -> Path:
         root = Path(base) if base else Path.home() / ".local" / "share"
 
     path = root / app_name
-    path.mkdir(parents=True, exist_ok=True)
+    # The registry may reference private paths, so keep the dir owner-only.
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
     return path
 
 
@@ -66,7 +70,7 @@ def user_config_dir(app_name: str = "ephemdir") -> Path:
     override = os.environ.get("EPHEMDIR_CONFIG_DIR")
     if override:
         path = Path(override)
-        path.mkdir(parents=True, exist_ok=True)
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
         return path
     if sys.platform == "win32":
         base = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
@@ -78,8 +82,54 @@ def user_config_dir(app_name: str = "ephemdir") -> Path:
         root = Path(base) if base else Path.home() / ".config"
 
     path = root / app_name
-    path.mkdir(parents=True, exist_ok=True)
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
     return path
+
+
+def boot_session_id() -> str | None:
+    """Return a stable identifier of the current boot session, if available.
+
+    Unlike :func:`boot_time` this does not depend on the wall clock, so
+    stepping the system time (NTP, manual changes) can never make ephemdir
+    believe the machine rebooted. Linux exposes
+    ``/proc/sys/kernel/random/boot_id``; Windows keeps a per-boot counter in
+    the registry. macOS returns ``None`` and falls back to the boot-time
+    comparison (``kern.boottime`` is a stored value, not derived from
+    uptime, so it is comparatively stable there).
+    """
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as handle:
+                return handle.read().strip() or None
+        except OSError:
+            return None
+    if sys.platform == "win32":
+        return _boot_session_id_windows()
+    return None
+
+
+def _boot_session_id_windows() -> str | None:  # pragma: no cover - Windows only
+    """Read Windows' per-boot counter from the registry.
+
+    ``GetTickCount64``-derived boot times shift whenever the wall clock is
+    corrected, so they cannot identify a boot session reliably. The
+    PrefetchParameters ``BootId`` value is incremented by the kernel on every
+    boot and does not depend on the clock at all.
+    """
+    if sys.platform != "win32":  # also lets type checkers skip the win32 API
+        return None
+    try:
+        import winreg
+
+        key_path = (
+            r"SYSTEM\CurrentControlSet\Control\Session Manager"
+            r"\Memory Management\PrefetchParameters"
+        )
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
+            value, _ = winreg.QueryValueEx(key, "BootId")
+        return f"win-boot-{int(value)}"
+    except (OSError, ValueError, TypeError, ImportError):
+        return None
 
 
 def boot_time() -> float | None:
@@ -120,11 +170,17 @@ def _boot_time_macos() -> float | None:
     """Read the exact boot time from ``sysctl kern.boottime`` on macOS/BSD."""
     import subprocess
 
+    executable = resolve_system_executable("sysctl")
+    if executable is None:
+        return None
     try:
         output = subprocess.check_output(
-            ["sysctl", "-n", "kern.boottime"],
+            [executable, "-n", "kern.boottime"],
             stderr=subprocess.DEVNULL,
             text=True,
+            timeout=5.0,
+            env=minimal_subprocess_env(),
+            cwd=stable_subprocess_cwd(),
         )
         # Output looks like: "{ sec = 1700000000, usec = 123456 } ..."
         marker = "sec = "

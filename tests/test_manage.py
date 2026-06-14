@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import time
 
 import pytest
@@ -50,7 +51,7 @@ def test_resolve_ambiguous_prefix_raises(tmp_path, registry, monkeypatch):
 
 def test_resolve_missing_dir_prunes_and_raises(tmp_path, registry):
     d = tempdir(parent=tmp_path, registry=registry)
-    d.path.rmdir()  # deleted behind ephemdir's back
+    shutil.rmtree(d.path)  # deleted behind ephemdir's back
     with pytest.raises(LookupError, match="no longer exists"):
         resolve(d.path.name, registry=registry)
     assert str(d.path) not in registered(registry=registry)
@@ -101,7 +102,7 @@ def test_remove_deletes_now(tmp_path, registry):
 def test_prune_drops_only_stale_entries(tmp_path, registry):
     gone = tempdir(parent=tmp_path, registry=registry)
     alive = tempdir(parent=tmp_path, registry=registry)
-    gone.path.rmdir()
+    shutil.rmtree(gone.path)
 
     assert prune(registry=registry) == 1
     state = registered(registry=registry)
@@ -110,31 +111,30 @@ def test_prune_drops_only_stale_entries(tmp_path, registry):
     assert alive.path.is_dir()  # prune never touches the disk
 
 
-def _entry(**overrides):
-    entry = {
-        "created_at": time.time(),
-        "expires_at": None,
-        "remove_on_restart": True,
-        "keep_while_in_use": False,
-        "boot_time": None,
-    }
-    entry.update(overrides)
-    return entry
-
-
-def test_dir_status_classification(tmp_path):
+def test_dir_status_classification(tmp_path, registry):
+    # Use a real tracked directory so the ownership marker checks out, then
+    # vary the entry fields to drive every status.
+    d = tempdir(parent=tmp_path, registry=registry)
+    entry = registered(registry=registry)[str(d.path)]
     now = time.time()
-    existing = tmp_path
-    missing = tmp_path / "nope"
-    assert dir_status(_entry(), missing, now, None) == "missing"
-    assert dir_status(_entry(expires_at=now - 1), existing, now, None) == "expired"
-    assert dir_status(_entry(expires_at=now + 60), existing, now, None) == "expiring"
-    assert dir_status(_entry(expires_at=now + 7200), existing, now, None) == "active"
-    assert dir_status(_entry(), existing, now, None) == "until-restart"
-    assert dir_status(_entry(remove_on_restart=False), existing, now, None) == "kept"
+
+    assert dir_status(entry, tmp_path / "nope", now, None) == "missing"
+    assert dir_status({**entry, "expires_at": now - 1}, d.path, now, None) == "expired"
+    assert dir_status({**entry, "expires_at": now + 60}, d.path, now, None) == "expiring"
+    assert dir_status({**entry, "expires_at": now + 7200}, d.path, now, None) == "active"
+    assert dir_status(entry, d.path, now, None) == "until-restart"
+    assert dir_status({**entry, "remove_on_restart": False}, d.path, now, None) == "kept"
+    assert dir_status({**entry, "marker_id": "other-id"}, d.path, now, None) == "replaced"
+    assert dir_status({**entry, "state": "deleting"}, d.path, now, None) == "deleting"
+    assert dir_status({**entry, "state": "moving"}, d.path, now, None) == "deleting"
+    assert dir_status({**entry, "state": "recovery"}, d.path, now, None) == "recovery"
+    legacy = {key: value for key, value in entry.items() if key != "marker_id"}
+    assert dir_status(legacy, d.path, now, None) == "legacy"
 
 
-def test_dir_status_expired_after_reboot(tmp_path):
+def test_dir_status_expired_after_reboot(tmp_path, registry):
+    d = tempdir(parent=tmp_path, registry=registry)
+    entry = dict(registered(registry=registry)[str(d.path)])
     now = time.time()
-    entry = _entry(boot_time=now - 10_000_000)
-    assert dir_status(entry, tmp_path, now, now) == "expired"
+    entry["boot_id"] = "older-boot"
+    assert dir_status(entry, d.path, now, now, "current-boot") == "expired"

@@ -2,12 +2,17 @@
 <!--
   macOS LaunchAgent template for periodic ephemdir cleanup.
 
-  Install:
-    1. Replace /usr/local/bin/ephemdir with the output of `which ephemdir`.
+  Prefer `ephemdir install-service`, which renders this file with the exact
+  interpreter path and validates the runtime. For manual installation:
+    1. Replace /usr/local/bin/python3 with the absolute path of the Python
+       interpreter that has ephemdir installed (`python3 -c "import sys; print(sys.executable)"`).
     2. Copy this file to ~/Library/LaunchAgents/
     3. Run: launchctl load ~/Library/LaunchAgents/com.vindfjur.ephemdir.sweep.plist
 
-  It sweeps once at login (RunAtLoad) and then every 600 seconds.
+  It sweeps once at login (RunAtLoad) and then every 600 seconds. The job runs
+  `python -I -m ephemdir` from / with a fixed PATH so neither the working
+  directory, PYTHONPATH/PYTHONHOME nor a polluted PATH can substitute the
+  imported package.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -16,12 +21,22 @@
     <string>com.vindfjur.ephemdir.sweep</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/ephemdir</string>
+        <string>/usr/local/bin/python3</string>
+        <string>-I</string>
+        <string>-m</string>
+        <string>ephemdir</string>
         <string>sweep</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>StartInterval</key>
     <integer>600</integer>
+    <key>WorkingDirectory</key>
+    <string>/</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/bin:/usr/sbin:/bin:/sbin</string>
+    </dict>
 </dict>
 </plist>

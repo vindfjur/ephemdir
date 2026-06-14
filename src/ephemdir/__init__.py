@@ -31,6 +31,7 @@ from .core import (
     extend,
     keep,
     prune,
+    recover,
     registered,
     remove,
     resolve,
@@ -38,7 +39,7 @@ from .core import (
     tempdir,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __author__ = "vindfjur"
 
 __all__ = [
@@ -50,6 +51,7 @@ __all__ = [
     "remove",
     "resolve",
     "prune",
+    "recover",
     "EphemeralDirectory",
     "__version__",
     "__author__",
