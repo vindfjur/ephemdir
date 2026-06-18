@@ -27,9 +27,15 @@ Managing directories later (by name, unique prefix or path)::
 from __future__ import annotations
 
 from .core import (
+    CleanupDecision,
+    CleanupPolicy,
     EphemeralDirectory,
+    SweepMode,
+    explain,
     extend,
     keep,
+    parse_size,
+    plan_sweep,
     prune,
     recover,
     registered,
@@ -39,7 +45,7 @@ from .core import (
     tempdir,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 __author__ = "vindfjur"
 
 __all__ = [
@@ -52,6 +58,12 @@ __all__ = [
     "resolve",
     "prune",
     "recover",
+    "explain",
+    "plan_sweep",
+    "parse_size",
+    "CleanupDecision",
+    "CleanupPolicy",
+    "SweepMode",
     "EphemeralDirectory",
     "__version__",
     "__author__",

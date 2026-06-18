@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 from contextlib import contextmanager
@@ -54,6 +55,42 @@ def test_mount_id_uses_mountinfo_after_older_interfaces(monkeypatch):
     assert core._linux_mount_id(123) == 42
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX fd semantics required")
+def test_delete_boundary_allows_same_linux_mount_with_different_st_dev(tmp_path, monkeypatch):
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(tmp_path, flags)
+    try:
+        monkeypatch.setattr(core.sys, "platform", "linux")
+        monkeypatch.setattr(core, "_mount_id_for_fd", lambda fd: 10)
+
+        core._check_child_mount_boundary(
+            fd,
+            root_dev=os.fstat(fd).st_dev + 1,
+            root_mount_id=10,
+        )
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX fd semantics required")
+def test_delete_boundary_blocks_different_linux_mount_with_same_st_dev(tmp_path, monkeypatch):
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(tmp_path, flags)
+    try:
+        monkeypatch.setattr(core.sys, "platform", "linux")
+        monkeypatch.setattr(core, "_mount_id_for_fd", lambda fd: 11)
+
+        with pytest.raises(OSError) as error:
+            core._check_child_mount_boundary(
+                fd,
+                root_dev=os.fstat(fd).st_dev,
+                root_mount_id=10,
+            )
+    finally:
+        os.close(fd)
+    assert error.value.errno == errno.EXDEV
+
+
 def test_recovery_name_is_reserved_during_new_creation(tmp_path, registry, monkeypatch):
     names = iter(["reserved-name", "reserved-name", "fresh-name"])
     monkeypatch.setattr(core, "funny_name", lambda words: next(names))
@@ -86,7 +123,7 @@ def test_recover_refuses_a_changed_snapshot(tmp_path, registry, monkeypatch, act
             {"state": "recovery", "claim_id": None, "staging_path": str(staging)}
         )
     changed = dict(registered(registry=registry)[str(d.path)])
-    changed["marker_id"] = "new-generation-marker"
+    changed["marker_id"] = "e" * 32
     changed["staging_path"] = str(tmp_path / f".{d.path.name}.456-fedcba98.deleting")
 
     @contextmanager

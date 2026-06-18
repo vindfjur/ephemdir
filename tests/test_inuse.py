@@ -30,12 +30,12 @@ def test_in_use_directory_removed_once_free(tmp_path, registry, monkeypatch):
     assert not d.path.exists()
 
 
-def test_force_ignores_in_use(tmp_path, registry, monkeypatch):
+def test_force_preserves_in_use_blocker(tmp_path, registry, monkeypatch):
     monkeypatch.setattr("ephemdir.core.is_in_use", lambda path: True)
     d = tempdir(keep_while_in_use=True, parent=tmp_path, registry=registry)
 
-    assert sweep(registry=registry, force=True) == 1
-    assert not d.path.exists()
+    assert sweep(registry=registry, force=True) == 0
+    assert d.path.exists()
 
 
 def test_locked_directory_is_deferred_without_partial_delete(tmp_path, registry, monkeypatch):

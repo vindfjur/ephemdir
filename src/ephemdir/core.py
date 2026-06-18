@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ctypes
 import errno
 import hashlib
 import logging
@@ -21,9 +20,40 @@ from typing import Any
 
 from ._config import load_config
 from ._inuse import is_in_use
-from ._naming import funny_name
+from ._mounts import (
+    MountBoundary,
+    MountBoundaryError,
+    verify_same_mount,
+)
+from ._mounts import (
+    linux_mount_id_fdinfo as _shared_linux_mount_id_fdinfo,
+)
+from ._mounts import (
+    linux_mount_id_mountinfo as _shared_linux_mount_id_mountinfo,
+)
+from ._mounts import (
+    linux_mount_id_statx as _shared_linux_mount_id_statx,
+)
+from ._naming import clean_name, funny_name
 from ._platform import boot_session_id, boot_time, same_boot, user_config_dir, user_data_dir
+from ._policy import CleanupDecision, CleanupPolicy, SweepMode, decide_cleanup
 from ._registry import Entry, Registry
+from ._security import (
+    open_or_create_trusted_directory as _security_open_or_create_trusted_directory,
+)
+from ._security import (
+    open_trusted_directory as _security_open_trusted_directory,
+)
+from ._security import (
+    trusted_component_error as _security_trusted_component_error,
+)
+from ._security import (
+    trusted_final_parent_error as _security_trusted_final_parent_error,
+)
+from ._security import (
+    walk_trusted_directory as _security_walk_trusted_directory,
+)
+from ._size import measure_tree, parse_size
 
 __all__ = [
     "EphemeralDirectory",
@@ -37,6 +67,12 @@ __all__ = [
     "prune",
     "recover",
     "dir_status",
+    "explain",
+    "plan_sweep",
+    "CleanupDecision",
+    "CleanupPolicy",
+    "SweepMode",
+    "parse_size",
 ]
 
 logger = logging.getLogger("ephemdir")
@@ -54,6 +90,9 @@ _DEFAULTS = {
     "parent": None,
     "prefix": "",
     "words": 2,
+    "cleanup": "auto",
+    "max_size": None,
+    "name_style": "secure",
 }
 
 # A lifetime may be given as seconds (int/float), a timedelta, a human string
@@ -62,6 +101,7 @@ Lifetime = int | float | str | timedelta | None
 
 # Maximum attempts to find a free, unique directory name before giving up.
 _MAX_NAME_ATTEMPTS = 100
+_MAX_PREFIX_CODEPOINTS = 64
 
 # A directory expiring within this window is reported as "expiring" by
 # :func:`dir_status`, so UIs can highlight it before it disappears.
@@ -240,154 +280,6 @@ class _DeleteFrame:
     name: str | None
     inode: tuple[int, int]
     close: bool
-
-
-class _StatxTimestamp(ctypes.Structure):
-    _fields_ = [
-        ("tv_sec", ctypes.c_int64),
-        ("tv_nsec", ctypes.c_uint32),
-        ("__reserved", ctypes.c_int32),
-    ]
-
-
-class _Statx(ctypes.Structure):
-    _fields_ = [
-        ("stx_mask", ctypes.c_uint32),
-        ("stx_blksize", ctypes.c_uint32),
-        ("stx_attributes", ctypes.c_uint64),
-        ("stx_nlink", ctypes.c_uint32),
-        ("stx_uid", ctypes.c_uint32),
-        ("stx_gid", ctypes.c_uint32),
-        ("stx_mode", ctypes.c_uint16),
-        ("__spare0", ctypes.c_uint16),
-        ("stx_ino", ctypes.c_uint64),
-        ("stx_size", ctypes.c_uint64),
-        ("stx_blocks", ctypes.c_uint64),
-        ("stx_attributes_mask", ctypes.c_uint64),
-        ("stx_atime", _StatxTimestamp),
-        ("stx_btime", _StatxTimestamp),
-        ("stx_ctime", _StatxTimestamp),
-        ("stx_mtime", _StatxTimestamp),
-        ("stx_rdev_major", ctypes.c_uint32),
-        ("stx_rdev_minor", ctypes.c_uint32),
-        ("stx_dev_major", ctypes.c_uint32),
-        ("stx_dev_minor", ctypes.c_uint32),
-        ("stx_mnt_id", ctypes.c_uint64),
-        ("__spare2", ctypes.c_uint64 * 13),
-    ]
-
-
-_AT_EMPTY_PATH = 0x1000
-_AT_NO_AUTOMOUNT = 0x800
-_STATX_BASIC_STATS = 0x000007FF
-_STATX_MNT_ID = 0x00001000
-_LIBC: ctypes.CDLL | None = None
-_STATX_UNAVAILABLE = False
-
-
-def _linux_mount_id_statx(fd: int) -> int | None:
-    """Return Linux mount id for an fd via ``statx``, when supported."""
-    global _LIBC, _STATX_UNAVAILABLE
-    if not sys.platform.startswith("linux") or _STATX_UNAVAILABLE:
-        return None
-    if _LIBC is None:
-        try:
-            _LIBC = ctypes.CDLL(None, use_errno=True)
-        except OSError:
-            _STATX_UNAVAILABLE = True
-            return None
-    statx_func = getattr(_LIBC, "statx", None)
-    if statx_func is None:
-        _STATX_UNAVAILABLE = True
-        return None
-    buffer = _Statx()
-    result = statx_func(
-        fd,
-        ctypes.c_char_p(b""),
-        _AT_EMPTY_PATH | _AT_NO_AUTOMOUNT,
-        _STATX_BASIC_STATS | _STATX_MNT_ID,
-        ctypes.byref(buffer),
-    )
-    if result != 0 or not (buffer.stx_mask & _STATX_MNT_ID):
-        return None
-    return int(buffer.stx_mnt_id)
-
-
-def _linux_mount_id_fdinfo(fd: int) -> int | None:
-    """Return Linux mount id from ``/proc/self/fdinfo`` as a statx fallback.
-
-    ``mnt_id`` has been exposed by procfs since Linux 3.15, substantially older
-    than ``STATX_MNT_ID``.  The file belongs to this process and identifies the
-    already-open descriptor, so no user-controlled pathname is followed.
-    """
-    if not sys.platform.startswith("linux"):
-        return None
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        info_fd = os.open(f"/proc/self/fdinfo/{fd}", flags)
-        with os.fdopen(info_fd, "r", encoding="ascii") as handle:
-            for line in handle:
-                key, separator, value = line.partition(":")
-                if separator and key == "mnt_id":
-                    parsed = value.strip()
-                    return int(parsed) if parsed.isdecimal() else None
-    except (OSError, UnicodeDecodeError, ValueError):
-        return None
-    return None
-
-
-def _unescape_mountinfo_path(value: str) -> str:
-    """Decode the octal escapes used for paths in ``/proc/*/mountinfo``."""
-    return re.sub(
-        r"\\([0-7]{3})",
-        lambda match: chr(int(match.group(1), 8)),
-        value,
-    )
-
-
-def _linux_mount_id_mountinfo(fd: int) -> int | None:
-    """Map an opened descriptor to the deepest mountpoint in mountinfo.
-
-    This fallback works on older kernels that expose neither ``STATX_MNT_ID``
-    nor ``mnt_id`` in fdinfo. Selecting the longest matching mountpoint detects
-    nested bind mounts even when they share the same device number.
-    """
-    if not sys.platform.startswith("linux"):
-        return None
-    try:
-        fd_path = os.readlink(f"/proc/self/fd/{fd}")
-        if fd_path.endswith(" (deleted)"):
-            fd_path = fd_path[: -len(" (deleted)")]
-        fd_path = os.path.normpath(fd_path)
-        best: tuple[int, int] | None = None
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        mountinfo_fd = os.open("/proc/self/mountinfo", flags)
-        with os.fdopen(mountinfo_fd, "r", encoding="utf-8") as handle:
-            for line in handle:
-                fields = line.split()
-                if len(fields) < 6 or not fields[0].isdecimal():
-                    continue
-                mountpoint = os.path.normpath(_unescape_mountinfo_path(fields[4]))
-                if fd_path == mountpoint or fd_path.startswith(mountpoint.rstrip("/") + "/"):
-                    candidate = (len(mountpoint), int(fields[0]))
-                    if best is None or candidate[0] >= best[0]:
-                        best = candidate
-        return None if best is None else best[1]
-    except (OSError, UnicodeDecodeError, ValueError):
-        return None
-
-
-def _linux_mount_id(fd: int) -> int | None:
-    """Return a stable Linux mount id using all available kernel interfaces."""
-    for probe in (
-        _linux_mount_id_statx,
-        _linux_mount_id_fdinfo,
-        _linux_mount_id_mountinfo,
-    ):
-        mount_id = probe(fd)
-        if mount_id is not None:
-            return mount_id
-    return None
 
 
 def _valid_staging_path(original: Path, staging: Path) -> bool:
@@ -586,10 +478,10 @@ def _deletion_guard(path: Path) -> str | None:
         if normalized in home.parents:
             return "ancestor of the home directory"
     for critical, label in (
-        (user_data_dir(), "ephemdir data directory"),
-        (user_config_dir(), "ephemdir config directory"),
+        (user_data_dir(create=False), "ephemdir data directory"),
+        (user_config_dir(create=False), "ephemdir config directory"),
     ):
-        resolved = critical.resolve()
+        resolved = critical.resolve(strict=False)
         if normalized == resolved:
             return label
         if normalized in resolved.parents:
@@ -597,22 +489,44 @@ def _deletion_guard(path: Path) -> str | None:
     return None
 
 
+def _trusted_component_error(path: Path, info: os.stat_result) -> str | None:
+    """Return why one parent-chain component is unsafe, or ``None``."""
+    return _security_trusted_component_error(path, info)
+
+
+def _trusted_final_parent_error(path: Path, info: os.stat_result) -> str | None:
+    """Return why the final parent cannot safely host managed entries."""
+    return _security_trusted_final_parent_error(path, info)
+
+
+def _walk_trusted_directory(
+    directory: Path,
+    *,
+    create_missing: bool,
+    allow_missing_tail: bool = False,
+) -> int | None:
+    """Walk a directory path component-by-component without following symlinks."""
+    return _security_walk_trusted_directory(
+        directory,
+        create_missing=create_missing,
+        allow_missing_tail=allow_missing_tail,
+    )
+
+
 def _trusted_parent_error(parent: Path) -> str | None:
     """Return why ``parent`` is unsafe for claim-by-rename, or ``None``."""
-    if os.name != "posix":
-        return None
     try:
-        parent_stat = os.stat(parent, follow_symlinks=False)
+        fd = _walk_trusted_directory(
+            parent,
+            create_missing=False,
+            allow_missing_tail=False,
+        )
+    except PermissionError as exc:
+        return str(exc)
     except OSError as exc:
         return f"parent directory cannot be inspected: {exc}"
-    if not stat.S_ISDIR(parent_stat.st_mode):
-        return "parent path is not a real directory"
-    mode = stat.S_IMODE(parent_stat.st_mode)
-    writable_by_others = bool(mode & 0o022)
-    if writable_by_others and not (mode & stat.S_ISVTX):
-        return "parent directory is group/world-writable without sticky bit"
-    if not writable_by_others and hasattr(os, "geteuid") and parent_stat.st_uid != os.geteuid():
-        return "parent directory is not owned by the current user"
+    if fd is not None:
+        os.close(fd)
     return None
 
 
@@ -623,22 +537,20 @@ def _parent_trust_error(path: Path) -> str | None:
 
 def _open_trusted_directory(directory: Path) -> int:
     """Open and re-verify a trusted directory for fd-relative operations."""
-    reason = _trusted_parent_error(directory)
-    if reason is not None:
-        raise PermissionError(f"refusing to operate in {directory}: {reason}")
-    fd = _open_directory_nofollow(directory)
     try:
-        fd_stat = os.fstat(fd)
-        live_stat = os.stat(directory, follow_symlinks=False)
-        if (fd_stat.st_dev, fd_stat.st_ino) != (live_stat.st_dev, live_stat.st_ino):
-            raise _StagingIdentityError(
-                errno.ESTALE,
-                f"directory {directory} changed before it could be used",
-            )
-        return fd
-    except BaseException:
-        os.close(fd)
-        raise
+        fd = _security_open_trusted_directory(directory)
+    except PermissionError as exc:
+        raise PermissionError(f"refusing to operate in {directory}: {exc}") from exc
+    return fd
+
+
+def _open_or_create_trusted_directory(directory: Path) -> int:
+    """Create any missing parent tail and return a verified final directory fd."""
+    try:
+        fd = _security_open_or_create_trusted_directory(directory)
+    except PermissionError as exc:
+        raise PermissionError(f"refusing to operate in {directory}: {exc}") from exc
+    return fd
 
 
 def _open_trusted_parent(path: Path) -> int:
@@ -727,7 +639,7 @@ class EphemeralDirectory:
         """
         if self._removed:
             return
-        entry = self._registry.load().get(str(self._path))
+        entry = self._registry.load(read_only=True).get(str(self._path))
         if entry is None:
             # Released via keep() or already cleaned up elsewhere. Deleting an
             # untracked path would betray the keep() promise, so leave it be.
@@ -792,6 +704,7 @@ class EphemeralDirectory:
                 )
             self._assert_entry_is_ours(entry)
             entry["expires_at"] = expires_at
+            entry["cleanup_policy"] = CleanupPolicy.AUTO.value
         self._expires_at = expires_at
         logger.info("extended ephemeral directory %s", self._path)
 
@@ -817,8 +730,11 @@ class EphemeralDirectory:
 def tempdir(
     lifetime: Lifetime = _UNSET,  # type: ignore[assignment]
     *,
+    cleanup: str = _UNSET,  # type: ignore[assignment]
     remove_on_restart: bool = _UNSET,  # type: ignore[assignment]
     keep_while_in_use: bool = _UNSET,  # type: ignore[assignment]
+    max_size: str | int | None = _UNSET,  # type: ignore[assignment]
+    name_style: str = _UNSET,  # type: ignore[assignment]
     parent: str | os.PathLike[str] | None = _UNSET,  # type: ignore[assignment]
     prefix: str = _UNSET,  # type: ignore[assignment]
     words: int = _UNSET,  # type: ignore[assignment]
@@ -845,6 +761,18 @@ def tempdir(
         has files open inside it; removal is deferred to a later sweep. Defaults
         to ``False``. On supported POSIX systems this is detected with ``lsof``.
         If the probe is unavailable, deletion is deferred rather than guessed.
+    cleanup:
+        ``"auto"`` keeps the normal lifetime/restart policy. ``"next-sweep"``
+        keeps the directory until an explicit full sweep, watcher or scheduler
+        run.
+    max_size:
+        Optional byte limit. A full or maintenance sweep removes the directory
+        once its measured tree size is above this limit.
+    name_style:
+        ``"secure"`` (or legacy alias ``"funny"``) appends a random suffix.
+        ``"clean"`` omits the suffix only in private parent directories.
+        ``"auto"`` uses clean names in private parents and secure names
+        elsewhere.
     parent:
         Where to create the directory. Defaults to the current working
         directory.
@@ -860,10 +788,13 @@ def tempdir(
     EphemeralDirectory
         A path-like handle to the created directory.
     """
-    settings = _resolve_settings(
+    settings, sources = _resolve_settings_with_sources(
         lifetime=lifetime,
+        cleanup=cleanup,
         remove_on_restart=remove_on_restart,
         keep_while_in_use=keep_while_in_use,
+        max_size=max_size,
+        name_style=name_style,
         parent=parent,
         prefix=prefix,
         words=words,
@@ -872,8 +803,49 @@ def tempdir(
     # Validate every input before any side effect (including the lazy sweep
     # below), so a bad argument can never half-run a cleanup first.
     expires_seconds = parse_lifetime(settings["lifetime"])
-    _validate_prefix(str(settings["prefix"]))
+    cleanup_policy = _parse_cleanup_policy(settings["cleanup"])
+    max_size_bytes = parse_size(settings["max_size"])
+    name_style_value = _parse_name_style(settings["name_style"])
+    remove_on_restart_value = _require_bool(
+        settings["remove_on_restart"],
+        "remove_on_restart",
+    )
+    keep_while_in_use_value = _require_bool(
+        settings["keep_while_in_use"],
+        "keep_while_in_use",
+    )
+    if cleanup_policy is CleanupPolicy.NEXT_SWEEP:
+        cleanup_source = sources["cleanup"]
+        explicit_lifetime_conflict = (
+            sources["lifetime"] == "explicit" and expires_seconds is not None
+        )
+        explicit_restart_conflict = (
+            sources["remove_on_restart"] == "explicit" and remove_on_restart_value
+        )
+        if cleanup_source != "explicit" and (
+            explicit_lifetime_conflict or explicit_restart_conflict
+        ):
+            cleanup_policy = CleanupPolicy.AUTO
+            settings["cleanup"] = cleanup_policy.value
+        elif (
+            sources["lifetime"] == cleanup_source
+            and expires_seconds is not None
+            or sources["remove_on_restart"] == cleanup_source
+            and remove_on_restart_value
+        ):
+            raise ValueError(
+                "--until-sweep cannot be combined with --lifetime or restart cleanup"
+            )
+        else:
+            settings["lifetime"] = None
+            settings["remove_on_restart"] = False
+            expires_seconds = None
+            remove_on_restart_value = False
+    if not isinstance(settings["prefix"], str):
+        raise TypeError("prefix must be a string")
+    _validate_prefix(settings["prefix"])
     _validate_words(settings["words"])
+    parent_path = _normalize_parent_value(settings["parent"])
 
     backend_error = _safe_delete_backend_error()
     if backend_error is not None:
@@ -882,44 +854,48 @@ def tempdir(
             f"cannot create an ephemeral directory safely: {backend_error}",
         )
 
+    # Normalize and verify the parent before the lazy sweep: predictable parent
+    # failures must not be preceded by unrelated cleanup side effects.  Missing
+    # tails are allowed here because the later create step makes them owner-only.
+    parent_fd = _preflight_existing_parent(parent_path)
+    try:
+        effective_name_style = _effective_name_style_for_preflight(
+            parent_path,
+            name_style_value,
+            parent_fd,
+        )
+    except BaseException:
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise
+
     reg = registry or Registry()
-    # Opportunistically clean up anything already due before creating more.
-    sweep(registry=reg)
-
-    parent_value = settings["parent"]
-    # Normalize to an absolute path: the registry key must stay valid no matter
-    # which working directory a later sweep runs from.
-    if parent_value is not None:
-        parent_path = Path(os.path.abspath(Path(parent_value).expanduser()))
-    else:
-        parent_path = Path.cwd()
-    parent_path.mkdir(parents=True, exist_ok=True)
-    trust_error = _trusted_parent_error(parent_path)
-    if trust_error is not None:
-        raise PermissionError(f"refusing to create ephemdir in {parent_path}: {trust_error}")
-
-    now = time.time()
-    expires_at = now + expires_seconds if expires_seconds is not None else None
-    remove_on_restart_value = bool(settings["remove_on_restart"])
-    created_boot_time = boot_time()
-    created_boot_id = boot_session_id()
     path: Path | None = None
     marker_id: str | None = None
-
+    # Opportunistically clean up anything already due before creating more.
     try:
+        sweep(registry=reg, mode=SweepMode.MAINTENANCE)
+        if parent_fd is None:
+            parent_fd = _open_or_create_trusted_directory(parent_path)
+
+        now = time.time()
+        expires_at = now + expires_seconds if expires_seconds is not None else None
+        created_boot_time = boot_time()
+        created_boot_id = boot_session_id()
+
         # Reserve the ordinary pathname against every lifecycle state while the
         # registry lock is held.  A recovery entry may have no object at its
         # original path, so filesystem exclusivity alone is not sufficient.
         # Creation, the marker write and the inode snapshot are all relative to
         # descriptors of the verified parent/new directory, so no ancestor
         # rename between these steps can redirect them elsewhere.
-        with reg.transaction() as state:
-            parent_fd = _open_trusted_directory(parent_path)
-            try:
+        try:
+            with reg.transaction() as state:
                 path = _create_unique_dir(
                     parent_path,
                     settings["prefix"],
                     settings["words"],
+                    name_style=effective_name_style,
                     reserved=frozenset(state),
                     parent_fd=parent_fd,
                 )
@@ -929,28 +905,35 @@ def tempdir(
                     path_stat = os.fstat(dir_fd)
                 finally:
                     os.close(dir_fd)
-            finally:
+                entry: Entry = {
+                    "created_at": now,
+                    "expires_at": expires_at,
+                    "remove_on_restart": remove_on_restart_value,
+                    "keep_while_in_use": keep_while_in_use_value,
+                    "cleanup_policy": cleanup_policy.value,
+                    "max_size": max_size_bytes,
+                    "name_style": effective_name_style,
+                    "registry_version": 2,
+                    "backend": "posix" if os.name == "posix" else sys.platform,
+                    "platform": sys.platform,
+                    "boot_time": created_boot_time,
+                    "boot_id": created_boot_id,
+                    "marker_id": marker_id,
+                    "state": "active",
+                    "claim_id": None,
+                    "staging_path": None,
+                }
+                if path_stat.st_ino:  # 0 means the filesystem does not report inodes
+                    entry["dev"] = path_stat.st_dev
+                    entry["ino"] = path_stat.st_ino
+                if str(path) in state:
+                    # Defensive assertion against future refactors that weaken the
+                    # reservation check. Never overwrite a deletion journal.
+                    raise FileExistsError(f"registry path became reserved: {path}")
+                state[str(path)] = entry
+        finally:
+            if parent_fd is not None:
                 os.close(parent_fd)
-            entry: Entry = {
-                "created_at": now,
-                "expires_at": expires_at,
-                "remove_on_restart": remove_on_restart_value,
-                "keep_while_in_use": bool(settings["keep_while_in_use"]),
-                "boot_time": created_boot_time,
-                "boot_id": created_boot_id,
-                "marker_id": marker_id,
-                "state": "active",
-                "claim_id": None,
-                "staging_path": None,
-            }
-            if path_stat.st_ino:  # 0 means the filesystem does not report inodes
-                entry["dev"] = path_stat.st_dev
-                entry["ino"] = path_stat.st_ino
-            if str(path) in state:
-                # Defensive assertion against future refactors that weaken the
-                # reservation check. Never overwrite a deletion journal.
-                raise FileExistsError(f"registry path became reserved: {path}")
-            state[str(path)] = entry
     except BaseException:
         # Never recursively delete by pathname after a failed registry commit:
         # another process could have replaced the directory in the meantime.
@@ -983,19 +966,112 @@ def _resolve_settings(**overrides: object) -> dict[str, Any]:
     Only arguments that differ from the ``_UNSET`` sentinel override the lower
     layers, so callers can selectively set just the options they care about.
     """
-    config = load_config()
-    resolved: dict[str, Any] = {}
-    for key, default in _DEFAULTS.items():
-        if overrides.get(key, _UNSET) is not _UNSET:
-            resolved[key] = overrides[key]
-        elif key in config:
-            resolved[key] = config[key]
-        else:
-            resolved[key] = default
+    resolved, _ = _resolve_settings_with_sources(**overrides)
     return resolved
 
 
-def sweep(*, registry: Registry | None = None, force: bool = False) -> int:
+def _resolve_settings_with_sources(**overrides: object) -> tuple[dict[str, Any], dict[str, str]]:
+    """Merge settings and report whether each value came from call/config/default."""
+    config = load_config()
+    resolved: dict[str, Any] = {}
+    sources: dict[str, str] = {}
+    for key, default in _DEFAULTS.items():
+        if overrides.get(key, _UNSET) is not _UNSET:
+            resolved[key] = overrides[key]
+            sources[key] = "explicit"
+        elif key in config:
+            resolved[key] = config[key]
+            sources[key] = "config"
+        else:
+            resolved[key] = default
+            sources[key] = "default"
+    return resolved, sources
+
+
+def _parse_cleanup_policy(value: object) -> CleanupPolicy:
+    if not isinstance(value, str):
+        raise TypeError("cleanup must be a string")
+    try:
+        return CleanupPolicy(value)
+    except ValueError as error:
+        raise ValueError("cleanup must be 'auto' or 'next-sweep'") from error
+
+
+def _parse_name_style(value: object) -> str:
+    if not isinstance(value, str):
+        raise TypeError("name_style must be a string")
+    text = value
+    if text == "funny":
+        return "secure"
+    if text not in {"auto", "clean", "secure"}:
+        raise ValueError("name_style must be 'auto', 'clean', or 'secure'")
+    return text
+
+
+def _require_bool(value: object, name: str) -> bool:
+    """Reject truthy/falsy coercion for public boolean API values."""
+    if not isinstance(value, bool):
+        raise TypeError(f"{name} must be a bool")
+    return value
+
+
+def _normalize_parent_value(value: object) -> Path:
+    """Normalize a parent argument without accepting unrelated object types."""
+    if value is None:
+        return Path.cwd()
+    if not isinstance(value, (str, os.PathLike)):
+        raise TypeError("parent must be str, os.PathLike, or None")
+    return Path(os.path.abspath(Path(value).expanduser()))
+
+
+def _preflight_existing_parent(parent: Path) -> int | None:
+    """Reject existing unusable parents before maintenance sweep side effects."""
+    try:
+        fd = _walk_trusted_directory(
+            parent,
+            create_missing=False,
+            allow_missing_tail=True,
+        )
+    except FileNotFoundError:
+        return None
+    except NotADirectoryError as exc:
+        raise FileExistsError(f"{parent} is not a directory") from exc
+    except PermissionError as exc:
+        raise PermissionError(f"refusing to create ephemdir in {parent}: {exc}") from exc
+    except OSError as exc:
+        raise PermissionError(f"refusing to create ephemdir in {parent}: {exc}") from exc
+    if fd is not None:
+        return fd
+    return None
+
+
+def _effective_name_style_for_preflight(
+    parent: Path,
+    name_style: str,
+    parent_fd: int | None,
+) -> str:
+    """Choose naming style using pre-sweep parent verification results."""
+    if name_style == "secure":
+        return "secure"
+    private = True if parent_fd is None else _is_private_parent_stat(os.fstat(parent_fd))
+    if name_style == "clean":
+        if not private:
+            raise PermissionError(
+                f"refusing clean ephemdir names in {parent}: parent is not private"
+            )
+        return "clean"
+    if name_style == "auto":
+        return "clean" if private else "secure"
+    raise ValueError("name_style must be 'auto', 'clean', or 'secure'")
+
+
+def sweep(
+    *,
+    registry: Registry | None = None,
+    force: bool = False,
+    dry_run: bool = False,
+    mode: SweepMode | str | None = None,
+) -> int:
     """Remove every tracked directory that is due for cleanup.
 
     Interrupted journal entries are reconciled under the same per-directory
@@ -1003,6 +1079,14 @@ def sweep(*, registry: Registry | None = None, force: bool = False) -> int:
     mistaken for a crashed one by a concurrent sweep.
     """
     reg = registry or Registry()
+    sweep_mode = SweepMode.FORCE if force else (SweepMode(mode) if mode else SweepMode.FULL)
+    is_force = sweep_mode is SweepMode.FORCE
+    if dry_run:
+        return sum(
+            1
+            for decision in plan_sweep(registry=reg, force=is_force, mode=sweep_mode)
+            if decision.destructive_allowed
+        )
     now = time.time()
     current_boot = boot_time()
     current_boot_id = boot_session_id()
@@ -1017,6 +1101,10 @@ def sweep(*, registry: Registry | None = None, force: bool = False) -> int:
         for key in list(state.keys()):
             entry = state[key]
             path = Path(key)
+            blockers = _entry_compatibility_blockers(entry)
+            if blockers:
+                logger.warning("deferring incompatible entry for %s: %s", path, ", ".join(blockers))
+                continue
             entry_state = entry.get("state", "active")
             if entry_state != "active":
                 journal.append((path, dict(entry)))
@@ -1033,11 +1121,16 @@ def sweep(*, registry: Registry | None = None, force: bool = False) -> int:
 
             reason = _deletion_guard(path)
             if reason is not None:
-                logger.warning("refusing to manage %s (%s); dropping the entry", path, reason)
-                del state[key]
+                logger.warning("deferring %s: %s", path, reason)
                 continue
 
-            if not (force or _is_due(entry, now, current_boot, current_boot_id)):
+            max_size_value = entry.get("max_size")
+            size_limited = isinstance(max_size_value, int) and max_size_value >= 0
+            if not (
+                is_force
+                or _is_due(entry, now, current_boot, current_boot_id, mode=sweep_mode)
+                or size_limited
+            ):
                 continue
 
             ownership = _ownership(path, entry)
@@ -1085,11 +1178,27 @@ def sweep(*, registry: Registry | None = None, force: bool = False) -> int:
                     path,
                     path.name,
                 )
+            elif status == "blocked":
+                logger.warning("deferring recovery for %s: incompatible registry entry", path)
 
     # Process active due entries.  Slow lsof/rmtree work stays outside the
     # registry lock; the per-directory lock prevents overlapping sweep calls.
     for path, snapshot in candidates:
-        if not force and snapshot.get("keep_while_in_use"):
+        decision = _decision_for_entry(
+            path,
+            snapshot,
+            now=now,
+            current_boot=current_boot,
+            current_boot_id=current_boot_id,
+            mode=sweep_mode,
+        )
+        if not decision.due:
+            continue
+        if decision.blockers:
+            logger.warning("deferring %s: %s", path, ", ".join(decision.blockers))
+            continue
+
+        if snapshot.get("keep_while_in_use"):
             in_use = is_in_use(path)
             if in_use:
                 logger.info("deferring in-use ephemeral directory %s", path)
@@ -1134,10 +1243,130 @@ def sweep(*, registry: Registry | None = None, force: bool = False) -> int:
     return removed
 
 
+def plan_sweep(
+    *,
+    registry: Registry | None = None,
+    force: bool = False,
+    mode: SweepMode | str | None = None,
+) -> list[CleanupDecision]:
+    """Return the read-only cleanup plan for the current registry."""
+    reg = registry or Registry()
+    sweep_mode = SweepMode.FORCE if force else (SweepMode(mode) if mode else SweepMode.FULL)
+    now = time.time()
+    current_boot = boot_time()
+    current_boot_id = boot_session_id()
+    decisions: list[CleanupDecision] = []
+    for key, entry in reg.load(read_only=True).items():
+        path = Path(key)
+        if entry.get("state", "active") != "active":
+            decisions.append(_recovery_plan_decision(path, entry))
+            continue
+        decisions.append(
+            _decision_for_entry(
+                path,
+                entry,
+                now=now,
+                current_boot=current_boot,
+                current_boot_id=current_boot_id,
+                mode=sweep_mode,
+            )
+        )
+    return decisions
+
+
+def _recovery_plan_decision(path: Path, entry: Entry) -> CleanupDecision:
+    """Plan crash recovery without taking locks or mutating state."""
+    compatibility_blockers = _entry_compatibility_blockers(entry)
+    if compatibility_blockers:
+        return _blocked_decision(
+            path,
+            entry,
+            ("recovery-required",) + compatibility_blockers,
+            reasons=("recovery-resume",),
+            due=True,
+        )
+    lifecycle = entry.get("state", "active")
+    if lifecycle == "recovery":
+        return _blocked_decision(
+            path,
+            entry,
+            ("recovery-required",),
+            reasons=("recovery-resume",),
+            due=True,
+        )
+    if lifecycle not in {"moving", "deleting"}:
+        return _blocked_decision(
+            path,
+            entry,
+            ("recovery-required",),
+            reasons=("recovery-resume",),
+            due=True,
+        )
+    reason = _deletion_guard(path)
+    if reason is not None:
+        return _blocked_decision(
+            path,
+            entry,
+            ("unsafe-parent",),
+            reasons=("recovery-resume",),
+            due=True,
+        )
+    staging_value = entry.get("staging_path")
+    staging = Path(staging_value) if isinstance(staging_value, str) else None
+    if staging is None or not _valid_staging_path(path, staging):
+        return _blocked_decision(
+            path,
+            entry,
+            ("recovery-required",),
+            reasons=("recovery-resume",),
+            due=True,
+        )
+    original_probe = _path_state(path)
+    staging_probe = _path_state(staging)
+    if original_probe == "unknown" or staging_probe == "unknown":
+        return _blocked_decision(
+            path,
+            entry,
+            ("ownership-unverified",),
+            reasons=("recovery-resume",),
+            due=True,
+        )
+    original_here = original_probe == "present"
+    staging_here = staging_probe == "present"
+    if not staging_here:
+        return _blocked_decision(
+            path,
+            entry,
+            ("recovery-required",),
+            reasons=("recovery-resume",),
+            due=True,
+        )
+    staging_verdict = _staging_ownership(path, staging, entry)
+    original_verdict = _ownership(path, entry) if original_here else "missing"
+    if staging_verdict == "ours" and (not original_here or original_verdict != "ours"):
+        return CleanupDecision(
+            path=path,
+            due=True,
+            status="due",
+            reasons=("recovery-resume",),
+            blockers=(),
+            destructive_allowed=True,
+            measured_size_bytes=None,
+            max_size_bytes=None,
+        )
+    return _blocked_decision(
+        path,
+        entry,
+        ("recovery-required",),
+        reasons=("recovery-resume",),
+        due=True,
+    )
+
+
 def registered(*, registry: Registry | None = None) -> dict[str, Entry]:
     """Return a snapshot of all currently tracked directories."""
     reg = registry or Registry()
-    return reg.load()
+    return reg.load(read_only=True)
 
 
 def _match_target(
@@ -1171,11 +1400,16 @@ def _resolve_active(
     reg = registry or Registry()
     state = {
         key: entry
-        for key, entry in reg.load().items()
+        for key, entry in reg.load(read_only=True).items()
         if entry.get("state", "active") == "active"
     }
     path = _match_target(target, state)
     snapshot = dict(state[str(path)])
+    blockers = _entry_compatibility_blockers(snapshot)
+    if blockers:
+        raise LookupError(
+            f"{path} is tracked for an incompatible runtime: {', '.join(blockers)}"
+        )
     probe = _path_state(path)
     if probe == "missing":
         with reg.transaction() as live:
@@ -1254,6 +1488,7 @@ def extend(
             # (e.g. a concurrent sweep); surface it instead of false success.
             raise LookupError(f"no tracked directory matches {os.fspath(target)!r}")
         entry["expires_at"] = expires_at
+        entry["cleanup_policy"] = CleanupPolicy.AUTO.value
     logger.info("extended %s", path)
     return path
 
@@ -1288,7 +1523,7 @@ def recover(
     if action not in {"retry", "forget"}:
         raise ValueError("action must be 'retry' or 'forget'")
     reg = registry or Registry()
-    all_state = reg.load()
+    all_state = reg.load(read_only=True)
     journal_state = {
         key: entry
         for key, entry in all_state.items()
@@ -1319,6 +1554,8 @@ def recover(
         )
         if status == "changed":
             raise LookupError(f"{path} recovery entry changed concurrently; reload and retry")
+        if status == "blocked":
+            raise OSError(f"{path} recovery entry is not compatible with this backend")
         if status == "resume":
             if staging is None or claimed is None:
                 raise OSError(f"invalid recovery payload for {path}; entry remains tracked")
@@ -1348,6 +1585,8 @@ def prune(*, registry: Registry | None = None) -> int:
             # Mid-deletion/recovery entries reference a staging tree that is
             # deliberately not at the original path; never prune those.
             if entry.get("state", "active") != "active":
+                continue
+            if _entry_compatibility_blockers(entry):
                 continue
             if _path_state(Path(key)) == "missing":
                 del state[key]
@@ -1380,6 +1619,8 @@ def dir_status(
         return "deleting"
     if entry_state == "recovery":
         return "recovery"
+    if _entry_compatibility_blockers(entry):
+        return "blocked"
     probe = _path_state(path)
     if probe == "missing":
         return "missing"
@@ -1390,6 +1631,8 @@ def dir_status(
         return "replaced"
     if ownership == "unverified":
         return "legacy"
+    if entry.get("cleanup_policy") == CleanupPolicy.NEXT_SWEEP.value:
+        return "until-sweep"
     if _is_due(entry, now, current_boot, current_boot_id):
         return "expired"
     expires_at = entry.get("expires_at")
@@ -1399,42 +1642,155 @@ def dir_status(
     return "until-restart" if entry.get("remove_on_restart") else "kept"
 
 
+def explain(
+    target: str | os.PathLike[str],
+    *,
+    registry: Registry | None = None,
+    mode: SweepMode | str = SweepMode.FULL,
+) -> CleanupDecision:
+    """Explain cleanup state for one active tracked directory."""
+    reg = registry or Registry()
+    state = reg.load(read_only=True)
+    path = _match_target(target, state)
+    return _decision_for_entry(
+        path,
+        state[str(path)],
+        now=time.time(),
+        current_boot=boot_time(),
+        current_boot_id=boot_session_id(),
+        mode=SweepMode(mode),
+    )
+
+
+def _decision_for_entry(
+    path: Path,
+    entry: Entry,
+    *,
+    now: float,
+    current_boot: float | None,
+    current_boot_id: str | None,
+    mode: SweepMode,
+    in_use: bool | None = False,
+) -> CleanupDecision:
+    compatibility_blockers = _entry_compatibility_blockers(entry)
+    if compatibility_blockers:
+        return _blocked_decision(path, entry, compatibility_blockers)
+    path_probe = _path_state(path)
+    ownership = "unverified"
+    parent_error = None
+    measured: int | None = None
+    complete = True
+    max_size_for_status = entry.get("max_size")
+    if path_probe == "present":
+        parent_error = _deletion_guard(path)
+        ownership = _ownership(path, entry)
+        if entry.get("keep_while_in_use") and in_use is False:
+            in_use = is_in_use(path)
+        max_size_value = entry.get("max_size")
+        if isinstance(max_size_value, int) and max_size_value >= 0:
+            result = measure_tree(path, limit=max_size_value)
+            measured = result.bytes
+            complete = result.complete
+    elif path_probe == "missing":
+        return CleanupDecision(
+            path=path,
+            due=False,
+            status="stale",
+            reasons=(),
+            blockers=(),
+            destructive_allowed=False,
+            measured_size_bytes=None,
+            max_size_bytes=(
+                max_size_for_status
+                if isinstance(max_size_for_status, int) and max_size_for_status >= 0
+                else None
+            ),
+        )
+    return decide_cleanup(
+        path,
+        entry,
+        now=now,
+        current_boot=current_boot,
+        current_boot_id=current_boot_id,
+        mode=mode,
+        path_state=path_probe,
+        ownership=ownership,
+        parent_error=parent_error,
+        in_use=in_use,
+        measured_size_bytes=measured,
+        size_complete=complete,
+        same_boot_func=same_boot,
+    )
+
+
+def _blocked_decision(
+    path: Path,
+    entry: Entry,
+    blockers: tuple[str, ...],
+    *,
+    reasons: tuple[str, ...] = (),
+    due: bool = False,
+    destructive_allowed: bool = False,
+) -> CleanupDecision:
+    max_size_value = entry.get("max_size")
+    return CleanupDecision(
+        path=path,
+        due=due,
+        status="blocked",
+        reasons=reasons,
+        blockers=blockers,
+        destructive_allowed=destructive_allowed,
+        measured_size_bytes=None,
+        max_size_bytes=(
+            max_size_value
+            if isinstance(max_size_value, int) and max_size_value >= 0
+            else None
+        ),
+    )
+
+
+def _entry_compatibility_blockers(entry: Entry) -> tuple[str, ...]:
+    """Return platform/backend blockers for entries unsafe on this runtime."""
+    blockers: list[str] = []
+    backend = entry.get("backend")
+    if isinstance(backend, str) and backend != "posix":
+        blockers.append("unsupported-backend")
+    platform = entry.get("platform")
+    if isinstance(platform, str) and platform != sys.platform:
+        blockers.append("foreign-platform")
+    return tuple(blockers)
+
+
 def _is_due(
     entry: Entry,
     now: float,
     current_boot: float | None,
     current_boot_id: str | None = None,
+    *,
+    mode: SweepMode = SweepMode.FULL,
 ) -> bool:
     """Decide whether a registry entry should be cleaned up now."""
-    expires_at = entry.get("expires_at")
-    if isinstance(expires_at, (int, float)) and now >= float(expires_at):
-        return True
-    if entry.get("remove_on_restart"):
-        created_id = entry.get("boot_id")
-        if current_boot_id is not None:
-            # A stable session id is authoritative.  If an older entry lacks
-            # one, a reboot cannot be proven safely, so keep the directory.
-            return isinstance(created_id, str) and created_id != current_boot_id
-        if isinstance(created_id, str):
-            # We recorded a stable id but cannot read the current one now.
-            return False
-        if sys.platform == "darwin":
-            # macOS kern.boottime is a stored kernel timestamp, not wall-clock
-            # minus uptime, so it is safe as the only timestamp fallback.
-            created_boot = entry.get("boot_time")
-            created_boot = created_boot if isinstance(created_boot, (int, float)) else None
-            return not same_boot(created_boot, current_boot)
-        # Linux/Windows uptime-derived timestamps move when the wall clock is
-        # stepped; absence of a stable id must fail safe rather than look like
-        # a reboot.
-        return False
-    return False
+    decision = decide_cleanup(
+        Path("."),
+        entry,
+        now=now,
+        current_boot=current_boot,
+        current_boot_id=current_boot_id,
+        mode=mode,
+        path_state="present",
+        ownership="owned",
+        parent_error=None,
+        same_boot_func=same_boot,
+    )
+    return decision.due
 
 
 def _validate_prefix(prefix: str) -> None:
     """Reject path separators and control characters in generated names."""
     if not prefix:
         return
+    if len(prefix) > _MAX_PREFIX_CODEPOINTS:
+        raise ValueError(f"prefix must be at most {_MAX_PREFIX_CODEPOINTS} characters")
     separators = {os.sep} | ({os.altsep} if os.altsep else set())
     if any(sep in prefix for sep in separators) or os.path.isabs(prefix):
         raise ValueError(
@@ -1456,6 +1812,7 @@ def _create_unique_dir(
     prefix: str,
     words: int,
     *,
+    name_style: str = "secure",
     reserved: set[str] | frozenset[str] = frozenset(),
     parent_fd: int | None = None,
 ) -> Path:
@@ -1469,8 +1826,12 @@ def _create_unique_dir(
     the creation.
     """
     _validate_prefix(prefix)
+    if name_style not in {"clean", "secure"}:
+        raise ValueError("name_style must be an effective 'clean' or 'secure' value")
+    style = name_style
     for _ in range(_MAX_NAME_ATTEMPTS):
-        name = f"{prefix}{funny_name(words)}"
+        generated = clean_name(words) if style == "clean" else funny_name(words)
+        name = f"{prefix}{generated}"
         candidate = parent / name
         if str(candidate) in reserved:
             continue
@@ -1485,6 +1846,44 @@ def _create_unique_dir(
     raise RuntimeError(
         f"could not create a unique directory in {parent} after "
         f"{_MAX_NAME_ATTEMPTS} attempts"
+    )
+
+
+def _effective_name_style(parent: Path, name_style: str) -> str:
+    """Choose the actual naming strategy for a verified parent directory."""
+    if name_style == "secure":
+        return "secure"
+    private = _is_private_parent(parent)
+    if name_style == "clean":
+        if not private:
+            raise PermissionError(
+                f"refusing clean ephemdir names in {parent}: parent is not private"
+            )
+        return "clean"
+    if name_style == "auto":
+        return "clean" if private else "secure"
+    raise ValueError("name_style must be 'auto', 'clean', or 'secure'")
+
+
+def _is_private_parent(parent: Path) -> bool:
+    """Return True only for owner-only local parent directories."""
+    if os.name != "posix" or not hasattr(os, "geteuid"):
+        return False
+    try:
+        info = os.stat(parent, follow_symlinks=False)
+    except OSError:
+        return False
+    return _is_private_parent_stat(info)
+
+
+def _is_private_parent_stat(info: os.stat_result) -> bool:
+    """Return True only for an owner-only local parent stat result."""
+    if os.name != "posix" or not hasattr(os, "geteuid"):
+        return False
+    return (
+        stat.S_ISDIR(info.st_mode)
+        and info.st_uid == os.geteuid()
+        and stat.S_IMODE(info.st_mode) & 0o077 == 0
     )
 
 
@@ -1558,6 +1957,34 @@ def _rmdir_verified_child(parent_fd: int, name: str, child_fd: int) -> None:
     os.rmdir(name, dir_fd=parent_fd)
 
 
+def _linux_mount_id_statx(fd: int) -> int | None:
+    """Compatibility wrapper for tests and private callers."""
+    return _shared_linux_mount_id_statx(fd)
+
+
+def _linux_mount_id_fdinfo(fd: int) -> int | None:
+    """Compatibility wrapper for tests and private callers."""
+    return _shared_linux_mount_id_fdinfo(fd)
+
+
+def _linux_mount_id_mountinfo(fd: int) -> int | None:
+    """Compatibility wrapper for tests and private callers."""
+    return _shared_linux_mount_id_mountinfo(fd)
+
+
+def _linux_mount_id(fd: int) -> int | None:
+    """Return a stable Linux mount id using the shared probe implementations."""
+    for probe in (
+        _linux_mount_id_statx,
+        _linux_mount_id_fdinfo,
+        _linux_mount_id_mountinfo,
+    ):
+        mount_id = probe(fd)
+        if mount_id is not None:
+            return mount_id
+    return None
+
+
 def _mount_id_for_fd(fd: int) -> int | None:
     """Return a stable mount id for fd when the platform exposes one."""
     return _linux_mount_id(fd)
@@ -1565,24 +1992,23 @@ def _mount_id_for_fd(fd: int) -> int | None:
 
 def _check_child_mount_boundary(child_fd: int, *, root_dev: int, root_mount_id: int | None) -> None:
     """Fail closed when a child directory crosses a filesystem or mount boundary."""
-    child_stat = os.fstat(child_fd)
-    if child_stat.st_dev != root_dev:
-        raise OSError(
-            errno.EXDEV,
-            "refusing to cross filesystem boundary while deleting staging tree",
-        )
-    if sys.platform.startswith("linux"):
-        child_mount_id = _mount_id_for_fd(child_fd)
-        if root_mount_id is None or child_mount_id is None:
+    boundary = MountBoundary(
+        root_dev=root_dev,
+        root_mount_id=root_mount_id,
+        mount_id_required=sys.platform.startswith("linux"),
+    )
+    try:
+        verify_same_mount(child_fd, boundary, mount_id_func=_mount_id_for_fd)
+    except MountBoundaryError as error:
+        if error.code == "mount-id-unavailable":
             raise OSError(
                 errno.ENOTSUP,
                 "cannot verify Linux mount boundary while deleting staging tree",
-            )
-        if child_mount_id != root_mount_id:
-            raise OSError(
-                errno.EXDEV,
-                "refusing to cross mount boundary while deleting staging tree",
-            )
+            ) from error
+        raise OSError(
+            errno.EXDEV,
+            "refusing to cross mount boundary while deleting staging tree",
+        ) from error
 
 
 def _scan_fd_names(dir_fd: int) -> Iterator[str]:
@@ -1982,7 +2408,7 @@ def _finish_deletion(registry: Registry, key: str, staging: Path, entry: Entry) 
         # and clear the process claim so a later lock holder can retry.
         live.update({"state": "recovery" if identity_lost else "deleting", "claim_id": None})
         if error is not None:
-            live["last_error"] = str(error)
+            live["last_error"] = _bounded_error_message(error)
     if identity_lost:
         logger.warning(
             "staging path for %s changed during deletion; entry parked for recovery",
@@ -1991,6 +2417,15 @@ def _finish_deletion(registry: Registry, key: str, staging: Path, entry: Entry) 
     else:
         logger.warning("partial deletion of %s; leftover %s stays tracked for retry", key, staging)
     return False
+
+
+def _bounded_error_message(error: BaseException, *, limit: int = 1024) -> str:
+    """Return a registry-safe bounded error message."""
+    message = str(error)
+    encoded = message.encode("utf-8", errors="replace")
+    if len(encoded) <= limit:
+        return message
+    return encoded[:limit].decode("utf-8", errors="ignore")
 
 
 def _recover_entry(
@@ -2017,6 +2452,8 @@ def _recover_entry(
         lifecycle = entry.get("state", "active")
         if lifecycle == "active":
             return "active", None, dict(entry)
+        if _entry_compatibility_blockers(entry):
+            return "blocked", None, dict(entry)
         if lifecycle == "recovery" and not retry_recovery:
             return "recovery", None, dict(entry)
         reason = _deletion_guard(original)
@@ -2111,7 +2548,7 @@ def _execute_remove(
     reason = _deletion_guard(path)
     if reason is not None:
         raise OSError(f"refusing to delete {path}: {reason}")
-    hint = expected or registry.load().get(str(path)) or {}
+    hint = expected or registry.load(read_only=True).get(str(path)) or {}
     with registry.deletion_lock(_deletion_lock_key(str(path), hint)) as acquired:
         if not acquired:
             raise OSError(

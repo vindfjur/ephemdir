@@ -2,9 +2,9 @@
 
 ## Supported Versions
 
-The supported release line is `0.4.x`. Supported runtimes are Python 3.10+ on
-Linux and macOS. Windows is not supported until a handle-bound recursive
-deletion backend is available.
+The supported release lines are `0.4.x` and `0.5.x`. Supported runtimes are
+Python 3.10+ on Linux and macOS. Windows is not supported until a handle-bound
+recursive deletion backend is available.
 
 ## Reporting a Vulnerability
 
@@ -28,13 +28,16 @@ POSIX deletion is fd-relative and refuses symlink, parent-trust and mount-bounda
 violations. When a platform cannot provide the required safe primitive,
 `tempdir()` fails before creation and cleanup fails closed before claim: the
 original pathname and active entry stay untouched rather than being moved or
-deleted by pathname. Registry reads accept only owner-private regular files
-up to 1 MiB and use non-blocking no-follow opens, preventing FIFOs and other
-special files from stalling commands or the scheduled sweeper. A registry that
-is group/world-*writable* is treated as potentially tampered: it is refused
+deleted by pathname. Registry reads and writes are bounded to 1 MiB, use a v2
+envelope on write, and use non-blocking no-follow opens, preventing FIFOs and
+other special files from stalling commands or the scheduled sweeper. A registry
+that is group/world-*writable* is treated as potentially tampered: it is refused
 outright (not parsed, swept, emptied or quarantined) and left in place for
 manual inspection, while a merely world-*readable* legacy registry is tightened
-to `0600` on load.
+to `0600` on load. Any malformed individual registry entry makes the whole
+registry invalid for that command; transactions copy the inspected bytes to a
+unique `registry.json.corrupt-*` file, leave the active registry path in place
+as a blocking object and abort instead of saving a filtered or empty state.
 
 ## `install-service` trust boundary
 
@@ -44,6 +47,10 @@ the interpreter, the entire `ephemdir` package tree (rejecting symlinked
 package subdirectories) and the interpreter-startup hooks (`.pth` files,
 `sitecustomize`, `pyvenv.cfg`, and `tomli` on Python 3.10) are owned by you or
 root and not writable by other users.
+It also pins the verified effective `EPHEMDIR_DATA_DIR` and
+`EPHEMDIR_CONFIG_DIR` into the installed launchd/systemd definition so the
+scheduled sweep does not drift to a different registry after logout/login or
+shell environment changes.
 
 What it does **not** do is recursively vet every module those hooks or runtime
 dependencies may import: a `.pth` line may run an arbitrary `import`, and
