@@ -3,4 +3,5 @@ include CODE_OF_CONDUCT.md
 include CONTRIBUTING.md
 include SECURITY.md
 include requirements-build.txt
+recursive-include docs *.md *.txt
 recursive-include packaging *

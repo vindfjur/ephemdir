@@ -31,7 +31,8 @@ import uuid
 from collections.abc import Iterator
 from pathlib import Path
 
-from ._platform import user_config_dir
+from ._platform import user_config_dir, user_data_dir
+from ._security import open_private_directory
 from ._trusted_exec import resolve_executable_in_dirs, trusted_system_dirs
 
 __all__ = ["ServiceError", "install_service", "uninstall_service", "sweep_command"]
@@ -72,6 +73,8 @@ def _scheduler_env() -> dict[str, str]:
     allowed = {
         "APPDATA",
         "DBUS_SESSION_BUS_ADDRESS",
+        "EPHEMDIR_CONFIG_DIR",
+        "EPHEMDIR_DATA_DIR",
         "HOME",
         "LANG",
         "LC_ALL",
@@ -79,6 +82,8 @@ def _scheduler_env() -> dict[str, str]:
         "LOCALAPPDATA",
         "LOGNAME",
         "USER",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
         "XDG_RUNTIME_DIR",
     }
     env = {key: value for key, value in os.environ.items() if key in allowed}
@@ -97,6 +102,25 @@ def _scheduler_cwd() -> str:
         return str(Path.home())
     except RuntimeError:
         return os.sep
+
+
+def _effective_service_environment() -> dict[str, str]:
+    """Pin the data/config directories a scheduled sweep must use later."""
+    data_dir = Path(os.path.abspath(user_data_dir(create=False)))
+    config_dir = Path(os.path.abspath(user_config_dir(create=False)))
+    for directory, label in ((data_dir, "data"), (config_dir, "config")):
+        try:
+            fd = open_private_directory(directory, create=True)
+        except OSError as error:
+            raise ServiceError(
+                f"refusing to install service: unsafe {label} directory {directory}: {error}"
+            ) from error
+        else:
+            os.close(fd)
+    return {
+        "EPHEMDIR_DATA_DIR": str(data_dir),
+        "EPHEMDIR_CONFIG_DIR": str(config_dir),
+    }
 
 
 def _run_scheduler(name: str, args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -593,7 +617,12 @@ def _verify_isolated_import() -> None:
 
 # --- macOS (launchd) -------------------------------------------------------
 
-def render_launchd_plist(interval: int, command: list[str]) -> str:
+def render_launchd_plist(
+    interval: int,
+    command: list[str],
+    *,
+    environment: dict[str, str] | None = None,
+) -> str:
     """Render a LaunchAgent plist that runs ``command`` every ``interval`` s.
 
     Built with :mod:`plistlib` so arbitrary characters in the command path are
@@ -601,15 +630,18 @@ def render_launchd_plist(interval: int, command: list[str]) -> str:
     so a directory the user can write to is never the working directory of the
     scheduled interpreter and ``launchctl setenv`` cannot inject a search path.
     """
+    env = {
+        "PATH": os.pathsep.join(str(path) for path in trusted_system_dirs()),
+    }
+    if environment:
+        env.update(environment)
     payload = {
         "Label": LAUNCHD_LABEL,
         "ProgramArguments": command,
         "RunAtLoad": True,
         "StartInterval": interval,
         "WorkingDirectory": "/",
-        "EnvironmentVariables": {
-            "PATH": os.pathsep.join(str(path) for path in trusted_system_dirs()),
-        },
+        "EnvironmentVariables": env,
     }
     return plistlib.dumps(payload, sort_keys=False).decode("utf-8")
 
@@ -620,7 +652,14 @@ def _launchd_path() -> Path:
 
 def _install_launchd(interval: int) -> str:
     path = _launchd_path()
-    _write_service_file(path, render_launchd_plist(interval, sweep_command()))
+    _write_service_file(
+        path,
+        render_launchd_plist(
+            interval,
+            sweep_command(),
+            environment=_effective_service_environment(),
+        ),
+    )
     # Unload best-effort: it legitimately fails when the agent was not loaded.
     _run_scheduler("launchctl", ["unload", str(path)])
     _run_checked([_resolve_scheduler("launchctl"), "load", str(path)], "launchctl load")
@@ -675,6 +714,7 @@ def render_systemd_units(
     command: list[str],
     *,
     env_executable: str = "/usr/bin/env",
+    environment: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Render the systemd service and timer with systemd-native escaping.
 
@@ -688,6 +728,12 @@ def render_systemd_units(
     """
     argv = [env_executable, "--", *command]
     exec_start = " ".join(_quote_systemd_arg(arg) for arg in argv)
+    environment_line = ""
+    if environment:
+        assignments = " ".join(
+            _quote_systemd_arg(f"{key}={value}") for key, value in sorted(environment.items())
+        )
+        environment_line = f"Environment={assignments}\n"
     # WorkingDirectory=/ keeps a user-writable directory (the default is the
     # home directory) from ever being the interpreter's cwd, and the Python
     # search-path environment is dropped outright. Both complement the `-I`
@@ -700,6 +746,7 @@ def render_systemd_units(
         "Type=oneshot\n"
         "WorkingDirectory=/\n"
         "UnsetEnvironment=PYTHONPATH PYTHONHOME PYTHONSTARTUP\n"
+        f"{environment_line}"
         f"ExecStart={exec_start}\n"
     )
     timer = (
@@ -728,7 +775,12 @@ def _install_systemd(interval: int) -> str:
     systemctl = _resolve_scheduler("systemctl")
     env_executable = _resolve_scheduler("env")
     units_dir = _systemd_dir()
-    units = render_systemd_units(interval, sweep_command(), env_executable=env_executable)
+    units = render_systemd_units(
+        interval,
+        sweep_command(),
+        env_executable=env_executable,
+        environment=_effective_service_environment(),
+    )
     for name, content in units.items():
         _write_service_file(units_dir / name, content)
     _run_checked([systemctl, "--user", "daemon-reload"], "systemctl daemon-reload")

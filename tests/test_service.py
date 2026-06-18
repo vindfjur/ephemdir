@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,22 @@ def test_launchd_plist_pins_working_directory_and_path():
     assert all(part.startswith("/") for part in environment["PATH"].split(os.pathsep))
 
 
+def test_launchd_plist_pins_effective_state_environment(tmp_path):
+    import plistlib
+
+    env = {
+        "EPHEMDIR_DATA_DIR": str(tmp_path / "data dir"),
+        "EPHEMDIR_CONFIG_DIR": str(tmp_path / "config dir"),
+    }
+    parsed = plistlib.loads(
+        render_launchd_plist(900, sweep_command(), environment=env).encode("utf-8")
+    )
+    environment = parsed["EnvironmentVariables"]
+    assert environment["EPHEMDIR_DATA_DIR"] == env["EPHEMDIR_DATA_DIR"]
+    assert environment["EPHEMDIR_CONFIG_DIR"] == env["EPHEMDIR_CONFIG_DIR"]
+    assert "PATH" in environment
+
+
 def test_systemd_units_have_service_and_timer():
     units = render_systemd_units(300, ["ephemdir", "sweep"])
     assert f"{SYSTEMD_UNIT}.service" in units
@@ -59,6 +76,22 @@ def test_systemd_service_isolates_python_environment():
     assert "UnsetEnvironment=PYTHONPATH PYTHONHOME PYTHONSTARTUP\n" in service
     assert ' "-I" ' not in service  # -I is a plain token, not quoted unit syntax
     assert " -I " in service
+
+
+def test_systemd_service_pins_effective_state_environment(tmp_path):
+    env = {
+        "EPHEMDIR_DATA_DIR": str(tmp_path / "data dir"),
+        "EPHEMDIR_CONFIG_DIR": str(tmp_path / "config dir"),
+    }
+    service = render_systemd_units(
+        300,
+        sweep_command(),
+        environment=env,
+    )[f"{SYSTEMD_UNIT}.service"]
+
+    assert "Environment=" in service
+    assert f'EPHEMDIR_DATA_DIR={env["EPHEMDIR_DATA_DIR"]}' in service
+    assert f'EPHEMDIR_CONFIG_DIR={env["EPHEMDIR_CONFIG_DIR"]}' in service
 
 
 def test_install_service_rejects_bad_interval():
@@ -192,6 +225,195 @@ def test_run_uses_controlled_environment(monkeypatch):
     assert captured["cwd"]
 
 
+def test_run_scheduler_resolves_trusted_binary(monkeypatch):
+    import subprocess
+
+    captured: list[list[str]] = []
+    monkeypatch.setattr(_service, "_resolve_scheduler", lambda name: f"/trusted/{name}")
+    monkeypatch.setattr(
+        _service,
+        "_run",
+        lambda command: captured.append(command)
+        or subprocess.CompletedProcess(command, 0, "", ""),
+    )
+
+    result = _service._run_scheduler("systemctl", ["--user", "status"])
+
+    assert result.returncode == 0
+    assert captured == [["/trusted/systemctl", "--user", "status"]]
+
+
+def test_scheduler_env_allowlist_pins_windows_roots(tmp_path, monkeypatch):
+    system32 = tmp_path / "Windows" / "System32"
+    monkeypatch.setenv("PYTHONPATH", "attacker")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+    monkeypatch.setattr(_service, "_trusted_scheduler_dirs", lambda: (system32,))
+    monkeypatch.setattr(_service.sys, "platform", "win32")
+
+    env = _service._scheduler_env()
+
+    assert env["PATH"] == str(system32)
+    assert env["SystemRoot"] == str(system32.parent)
+    assert env["WINDIR"] == str(system32.parent)
+    assert env["XDG_RUNTIME_DIR"] == "/run/user/1000"
+    assert "PYTHONPATH" not in env
+
+
+def test_scheduler_cwd_falls_back_to_root(monkeypatch):
+    monkeypatch.setattr(
+        _service.Path,
+        "home",
+        lambda: (_ for _ in ()).throw(RuntimeError("no home")),
+    )
+
+    assert _service._scheduler_cwd() == os.sep
+
+
+def test_effective_service_environment_opens_private_state_dirs(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data dir"
+    config_dir = tmp_path / "config dir"
+    opened: list[tuple[Path, bool]] = []
+
+    def fake_open_private_directory(directory, *, create):
+        path = Path(directory)
+        path.mkdir(parents=True, exist_ok=True)
+        opened.append((path, create))
+        return os.open(path, os.O_RDONLY)
+
+    monkeypatch.setattr(_service, "user_data_dir", lambda create=False: data_dir)
+    monkeypatch.setattr(_service, "user_config_dir", lambda create=False: config_dir)
+    monkeypatch.setattr(
+        _service,
+        "open_private_directory",
+        fake_open_private_directory,
+    )
+
+    env = _service._effective_service_environment()
+
+    assert env == {
+        "EPHEMDIR_DATA_DIR": str(data_dir),
+        "EPHEMDIR_CONFIG_DIR": str(config_dir),
+    }
+    assert opened == [(data_dir, True), (config_dir, True)]
+
+
+def test_effective_service_environment_refuses_unsafe_state_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(_service, "user_data_dir", lambda create=False: tmp_path / "data")
+    monkeypatch.setattr(_service, "user_config_dir", lambda create=False: tmp_path / "config")
+
+    def reject(directory, *, create):
+        raise OSError("unsafe permissions")
+
+    monkeypatch.setattr(_service, "open_private_directory", reject)
+
+    with pytest.raises(_service.ServiceError, match="unsafe data directory"):
+        _service._effective_service_environment()
+
+
+def test_run_timeout_is_reported_as_service_error(monkeypatch):
+    import subprocess
+
+    def timeout(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(_service.subprocess, "run", timeout)
+
+    with pytest.raises(_service.ServiceError, match="timed out"):
+        _service._run(["systemctl", "--user", "status"])
+
+
+def test_run_checked_uses_stdout_when_stderr_is_empty(monkeypatch):
+    import subprocess
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(command, 2, stdout="unit missing", stderr="")
+
+    monkeypatch.setattr(_service.subprocess, "run", fake_run)
+
+    with pytest.raises(_service.ServiceError, match="unit missing"):
+        _service._run_checked(["systemctl"], "systemctl show")
+
+
+def test_service_dir_component_policy_errors():
+    current = Path("/synthetic")
+    uid = os.geteuid() if hasattr(os, "geteuid") else 1
+
+    with pytest.raises(_service.ServiceError, match="not a real directory"):
+        _service._check_service_dir_component(
+            current,
+            os.stat_result((stat.S_IFREG | 0o600, 1, 1, 1, uid, 0, 0, 0, 0, 0)),
+            final=True,
+        )
+
+    with pytest.raises(_service.ServiceError, match="writable by other users"):
+        _service._check_service_dir_component(
+            current,
+            os.stat_result((stat.S_IFDIR | 0o777, 1, 1, 1, uid, 0, 0, 0, 0, 0)),
+            final=True,
+        )
+
+    with pytest.raises(_service.ServiceError, match="not owned"):
+        _service._check_service_dir_component(
+            current,
+            os.stat_result((stat.S_IFDIR | 0o700, 1, 1, 1, uid + 1, 0, 0, 0, 0, 0)),
+            final=True,
+        )
+
+    with pytest.raises(_service.ServiceError, match="without sticky"):
+        _service._check_service_dir_component(
+            current,
+            os.stat_result((stat.S_IFDIR | 0o777, 1, 1, 1, uid, 0, 0, 0, 0, 0)),
+            final=False,
+        )
+
+    _service._check_service_dir_component(
+        current,
+        os.stat_result((stat.S_IFDIR | 0o1777, 1, 1, 1, 0, 0, 0, 0, 0, 0)),
+        final=False,
+    )
+
+
+def test_open_verified_service_dir_rejects_identity_swap(tmp_path, monkeypatch):
+    units = tmp_path / "units"
+    units.mkdir()
+    real_open = os.open
+    real_fstat = os.fstat
+    real_lstat = os.lstat
+
+    def changed_lstat(path):
+        info = real_lstat(path)
+        values = list(info)
+        values[1] = info.st_ino + 1
+        return os.stat_result(values)
+
+    monkeypatch.setattr(_service, "_validate_service_dir_chain", lambda directory: None)
+    monkeypatch.setattr(_service, "_check_service_dir_component", lambda *args, **kwargs: None)
+    monkeypatch.setattr(_service.os, "open", real_open)
+    monkeypatch.setattr(_service.os, "fstat", real_fstat)
+    monkeypatch.setattr(_service.os, "lstat", changed_lstat)
+
+    with pytest.raises(_service.ServiceError, match="changed"):
+        _service._open_verified_service_dir(units)
+
+
+def test_runtime_path_and_dir_type_checks(tmp_path, monkeypatch):
+    directory = tmp_path / "runtime-dir"
+    directory.mkdir()
+    file_path = tmp_path / "runtime-file"
+    file_path.write_text("", encoding="utf-8")
+
+    # The real pytest temp root can live under /tmp in containers. Sanitize the
+    # chain so this test reaches the final object-type checks deterministically.
+    monkeypatch.setattr(os, "lstat", _synthetic_lstat(os.lstat))
+    monkeypatch.setattr(os, "stat", _synthetic_lstat(os.stat))
+
+    with pytest.raises(_service.ServiceError, match="not a regular file"):
+        _service._validate_runtime_path(directory, "runtime")
+
+    with pytest.raises(_service.ServiceError, match="not a directory"):
+        _service._validate_runtime_dir(file_path, "runtime dir")
+
+
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlink support required")
 def test_write_service_file_replaces_symlink_without_following(tmp_path):
     victim = tmp_path / "victim"
@@ -291,6 +513,18 @@ def test_isolated_import_check_rejects_other_package_location(monkeypatch):
         _service._verify_isolated_import()
 
 
+def test_isolated_import_check_reports_timeout(monkeypatch):
+    import subprocess
+
+    def timeout(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(_service.subprocess, "run", timeout)
+
+    with pytest.raises(_service.ServiceError, match="timed out"):
+        _service._verify_isolated_import()
+
+
 
 def test_windows_service_install_is_refused(monkeypatch):
     monkeypatch.setattr(_service.sys, "platform", "win32")
@@ -307,6 +541,19 @@ def test_runtime_path_rejects_other_user_writable_component(tmp_path):
 
     with pytest.raises(_service.ServiceError, match="writable by other users"):
         _service._validate_runtime_path(runtime, "test runtime")
+
+
+def test_runtime_component_rejects_sticky_shared_temp_dir():
+    sticky_tmp = os.stat_result(
+        (stat.S_IFDIR | 0o1777, 1, 2, 1, 0, 0, 0, 0, 0, 0)
+    )
+
+    with pytest.raises(_service.ServiceError, match="shared directories like /tmp"):
+        _service._check_runtime_component(
+            Path("/tmp"),
+            sticky_tmp,
+            "test runtime path component",
+        )
 
 
 def _synthetic_lstat(real_lstat, foreign=()):
@@ -397,6 +644,287 @@ def test_install_service_validates_persistent_runtime(monkeypatch):
     monkeypatch.setattr(_service, "_validate_service_runtime", reject)
     with pytest.raises(_service.ServiceError, match="unsafe persistent runtime"):
         _service.install_service()
+
+
+def test_install_service_rejects_root_user(monkeypatch):
+    monkeypatch.setattr(_service.sys, "platform", "linux")
+    monkeypatch.setattr(_service.os, "geteuid", lambda: 0, raising=False)
+
+    with pytest.raises(_service.ServiceError, match="not root"):
+        _service.install_service()
+
+
+def test_install_service_dispatches_linux_after_validation(monkeypatch):
+    monkeypatch.setattr(_service.sys, "platform", "linux")
+    monkeypatch.setattr(_service, "_reject_elevated_user_install", lambda: None)
+    monkeypatch.setattr(_service, "_validate_service_runtime", lambda: None)
+    monkeypatch.setattr(_service, "_verify_isolated_import", lambda: None)
+    monkeypatch.setattr(_service, "_install_systemd", lambda interval: f"linux:{interval}")
+
+    assert _service.install_service(interval=42) == "linux:42"
+
+
+def test_install_service_dispatches_darwin_after_validation(monkeypatch):
+    monkeypatch.setattr(_service.sys, "platform", "darwin")
+    monkeypatch.setattr(_service, "_reject_elevated_user_install", lambda: None)
+    monkeypatch.setattr(_service, "_validate_service_runtime", lambda: None)
+    monkeypatch.setattr(_service, "_verify_isolated_import", lambda: None)
+    monkeypatch.setattr(_service, "_install_launchd", lambda interval: f"darwin:{interval}")
+
+    assert _service.install_service(interval=11) == "darwin:11"
+
+
+def test_uninstall_service_dispatches_by_platform(monkeypatch):
+    monkeypatch.setattr(_service.sys, "platform", "darwin")
+    monkeypatch.setattr(_service, "_uninstall_launchd", lambda: "launchd")
+    assert _service.uninstall_service() == "launchd"
+
+    monkeypatch.setattr(_service.sys, "platform", "win32")
+    monkeypatch.setattr(_service, "_uninstall_windows", lambda: "windows")
+    assert _service.uninstall_service() == "windows"
+
+    monkeypatch.setattr(_service.sys, "platform", "linux")
+    monkeypatch.setattr(_service, "_uninstall_systemd", lambda: "systemd")
+    assert _service.uninstall_service() == "systemd"
+
+
+def test_uninstall_systemd_reports_absent_timer(tmp_path, monkeypatch):
+    monkeypatch.setattr(_service, "_systemd_dir", lambda: tmp_path)
+
+    assert _service._uninstall_systemd() == "no systemd timer installed"
+
+
+def test_uninstall_systemd_removes_inactive_units(tmp_path, monkeypatch):
+    service = tmp_path / f"{SYSTEMD_UNIT}.service"
+    timer = tmp_path / f"{SYSTEMD_UNIT}.timer"
+    service.write_text("", encoding="utf-8")
+    timer.write_text("", encoding="utf-8")
+    checked: list[list[str]] = []
+
+    monkeypatch.setattr(_service, "_systemd_dir", lambda: tmp_path)
+    monkeypatch.setattr(_service, "_resolve_scheduler", lambda name: name)
+    monkeypatch.setattr(
+        _service,
+        "_run",
+        lambda command: type(
+            "Completed",
+            (),
+            {
+                "returncode": 0,
+                "stdout": "inactive\n" if "show" in command else "",
+                "stderr": "",
+            },
+        )(),
+    )
+    monkeypatch.setattr(_service, "_run_checked", lambda command, action: checked.append(command))
+
+    assert _service._uninstall_systemd() == f"removed systemd user timer from {tmp_path}"
+    assert not service.exists()
+    assert not timer.exists()
+    assert checked == [["systemctl", "--user", "daemon-reload"]]
+
+
+def test_uninstall_systemd_refuses_uncertain_timer_state(tmp_path, monkeypatch):
+    (tmp_path / f"{SYSTEMD_UNIT}.timer").write_text("", encoding="utf-8")
+    monkeypatch.setattr(_service, "_systemd_dir", lambda: tmp_path)
+    monkeypatch.setattr(_service, "_resolve_scheduler", lambda name: name)
+    monkeypatch.setattr(
+        _service,
+        "_run",
+        lambda command: type(
+            "Completed",
+            (),
+            {"returncode": 0, "stdout": "activating\n" if "show" in command else "", "stderr": ""},
+        )(),
+    )
+
+    with pytest.raises(_service.ServiceError, match="could not confirm"):
+        _service._uninstall_systemd()
+
+
+def test_launchd_install_and_uninstall_paths(tmp_path, monkeypatch):
+    plist = tmp_path / "agent.plist"
+    written: list[tuple[Path, str]] = []
+    scheduler_calls: list[tuple[str, list[str]]] = []
+    checked: list[tuple[list[str], str]] = []
+
+    monkeypatch.setattr(_service, "_launchd_path", lambda: plist)
+    monkeypatch.setattr(
+        _service,
+        "_write_service_file",
+        lambda path, content: written.append((path, content)),
+    )
+    monkeypatch.setattr(
+        _service,
+        "_effective_service_environment",
+        lambda: {"EPHEMDIR_DATA_DIR": "/data", "EPHEMDIR_CONFIG_DIR": "/config"},
+    )
+    monkeypatch.setattr(
+        _service,
+        "_run_scheduler",
+        lambda name, args: scheduler_calls.append((name, args))
+        or type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+    )
+    monkeypatch.setattr(_service, "_resolve_scheduler", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(
+        _service,
+        "_run_checked",
+        lambda command, action: checked.append((command, action)),
+    )
+
+    assert "installed LaunchAgent" in _service._install_launchd(9)
+    assert written and written[0][0] == plist
+    assert scheduler_calls == [("launchctl", ["unload", str(plist)])]
+    assert checked == [(["/bin/launchctl", "load", str(plist)], "launchctl load")]
+
+    plist.write_text("", encoding="utf-8")
+    assert _service._uninstall_launchd() == f"removed LaunchAgent {plist}"
+    assert not plist.exists()
+
+
+def test_launchd_uninstall_error_paths(tmp_path, monkeypatch):
+    plist = tmp_path / "agent.plist"
+    plist.write_text("", encoding="utf-8")
+    responses = iter(
+        [
+            type("Completed", (), {"returncode": 1, "stdout": "", "stderr": "busy"})(),
+            type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+        ]
+    )
+
+    monkeypatch.setattr(_service, "_launchd_path", lambda: plist)
+    monkeypatch.setattr(_service, "_run_scheduler", lambda name, args: next(responses))
+    with pytest.raises(_service.ServiceError, match="still loaded"):
+        _service._uninstall_launchd()
+
+    responses = iter(
+        [
+            type("Completed", (), {"returncode": 1, "stdout": "", "stderr": "busy"})(),
+            type("Completed", (), {"returncode": 1, "stdout": "", "stderr": "unknown"})(),
+        ]
+    )
+    monkeypatch.setattr(_service, "_run_scheduler", lambda name, args: next(responses))
+    with pytest.raises(_service.ServiceError, match="could not prove"):
+        _service._uninstall_launchd()
+
+
+def test_systemd_install_writes_units_and_enables_timer(tmp_path, monkeypatch):
+    written: list[Path] = []
+    checked: list[tuple[list[str], str]] = []
+
+    def resolve(name):
+        return f"/usr/bin/{name}"
+
+    monkeypatch.setattr(_service, "_resolve_scheduler", resolve)
+    monkeypatch.setattr(_service, "_systemd_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        _service,
+        "_effective_service_environment",
+        lambda: {"EPHEMDIR_DATA_DIR": "/data", "EPHEMDIR_CONFIG_DIR": "/config"},
+    )
+    monkeypatch.setattr(
+        _service,
+        "_write_service_file",
+        lambda path, content: written.append(path),
+    )
+    monkeypatch.setattr(
+        _service,
+        "_run_checked",
+        lambda command, action: checked.append((command, action)),
+    )
+
+    assert "installed systemd user timer" in _service._install_systemd(13)
+    assert sorted(path.name for path in written) == [
+        f"{SYSTEMD_UNIT}.service",
+        f"{SYSTEMD_UNIT}.timer",
+    ]
+    assert checked[-1] == (
+        ["/usr/bin/systemctl", "--user", "enable", "--now", f"{SYSTEMD_UNIT}.timer"],
+        "systemctl enable",
+    )
+
+
+def test_windows_install_and_uninstall_success(monkeypatch):
+    checked: list[tuple[list[str], str]] = []
+    monkeypatch.setattr(_service, "_resolve_scheduler", lambda name: name)
+    monkeypatch.setattr(
+        _service,
+        "_run_checked",
+        lambda command, action: checked.append((command, action)),
+    )
+
+    assert "scheduled task" in _service._install_windows(30)
+    assert checked[0][0][-1] == "1"
+
+    monkeypatch.setattr(
+        _service,
+        "_run",
+        lambda command: type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+    )
+    assert _service._uninstall_windows() == "removed scheduled task 'ephemdir-sweep'"
+
+
+def test_startup_file_iteration_and_tomli_validation(tmp_path, monkeypatch):
+    sitecustomize = tmp_path / "sitecustomize.py"
+    sitecustomize.write_text("", encoding="utf-8")
+    pyvenv_cfg = tmp_path / "pyvenv.cfg"
+    pyvenv_cfg.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(_service, "_site_directories", lambda: [])
+    monkeypatch.setattr(_service.sys, "prefix", str(tmp_path))
+    monkeypatch.setattr(
+        _service.importlib.util,
+        "find_spec",
+        lambda name: type("Spec", (), {"origin": str(sitecustomize)})()
+        if name == "sitecustomize"
+        else None,
+    )
+
+    found = {path.name: label for path, label in _service._iter_startup_files()}
+    assert found == {
+        "sitecustomize.py": "sitecustomize module",
+        "pyvenv.cfg": "pyvenv.cfg",
+    }
+
+    tomli = tmp_path / "tomli" / "__init__.py"
+    tomli.parent.mkdir()
+    tomli.write_text("", encoding="utf-8")
+    checked: list[Path] = []
+    monkeypatch.setattr(_service, "_iter_startup_files", lambda: iter(()))
+    monkeypatch.setattr(_service.sys, "version_info", (3, 10, 0))
+    monkeypatch.setattr(
+        _service.importlib.util,
+        "find_spec",
+        lambda name: type("Spec", (), {"origin": str(tomli)})() if name == "tomli" else None,
+    )
+    monkeypatch.setattr(_service, "_validate_package_tree", lambda path: checked.append(path))
+
+    _service._validate_startup_environment()
+
+    assert checked == [tomli.parent]
+
+
+def test_validate_service_runtime_checks_interpreter_package_and_startup(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(
+        _service,
+        "_validate_runtime_path",
+        lambda path, label: calls.append(f"path:{label}"),
+    )
+    monkeypatch.setattr(
+        _service,
+        "_validate_package_tree",
+        lambda path: calls.append("package"),
+    )
+    monkeypatch.setattr(
+        _service,
+        "_validate_startup_environment",
+        lambda: calls.append("startup"),
+    )
+
+    _service._validate_service_runtime()
+
+    assert calls == ["path:Python interpreter", "package", "startup"]
 
 
 def _make_fake_package(root):
@@ -492,23 +1020,21 @@ def test_validate_package_tree_rejects_foreign_owned_empty_subdir(tmp_path, monk
     _service._validate_package_tree(pkg)  # must not raise
 
 
-@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits required")
-def test_validate_package_tree_fails_closed_on_unreadable_subdir(tmp_path):
+def test_validate_package_tree_fails_closed_on_unreadable_subdir(tmp_path, monkeypatch):
     # LOW-08: os.walk() silently skips a subdirectory it cannot enter, so a
     # foreign __pycache__ at mode 0000 would never be validated and the install
-    # reported as safe. The traversal must fail closed instead. A 0000 dir is
-    # unreadable even by its owner, so this exercises the onerror path without
-    # needing a second uid.
+    # reported as safe. The traversal must fail closed instead. Model the
+    # onerror callback directly so root/container runs exercise the same path.
     pkg = _make_fake_package(tmp_path)
-    cache = pkg / "__pycache__"
-    for entry in cache.iterdir():
-        entry.unlink()
-    os.chmod(cache, 0o000)
-    try:
-        with pytest.raises(_service.ServiceError):
-            _service._validate_package_tree(pkg)
-    finally:
-        os.chmod(cache, 0o755)  # restore so tmp_path cleanup can recurse in
+
+    def unreadable_walk(path, *, onerror=None, **kwargs):
+        if onerror is not None:
+            onerror(PermissionError(f"cannot read {path}"))
+        yield from ()
+
+    monkeypatch.setattr(_service.os, "walk", unreadable_walk)
+    with pytest.raises(_service.ServiceError, match="cannot inspect package directory"):
+        _service._validate_package_tree(pkg)
 
 
 def test_validate_package_tree_requires_some_module(tmp_path, monkeypatch):

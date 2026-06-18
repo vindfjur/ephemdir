@@ -4,6 +4,46 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-06-18
+
+### Added
+- Added `cleanup="next-sweep"` / `ephemdir new --until-sweep` for directories
+  that are removed only by explicit full sweeps, watchers or schedulers.
+- Added `max_size` cleanup thresholds with bounded, mount-aware POSIX size
+  scanning.
+- Added `name_style=auto|clean|secure`; clean names are allowed only in
+  owner-private parent directories.
+- Added `ephemdir sweep --dry-run`, `ephemdir explain`, `ephemdir doctor`,
+  `ephemdir menu`, `ephemdir completion show` and completion script printing.
+- Added a registry v2 envelope with legacy flat-registry migration on the next
+  write.
+
+### Changed
+- v0.5.0 is a POSIX-only hardening release for Linux and macOS. Windows remains
+  intentionally unsupported until a handle-bound recursive deletion backend is
+  available.
+- `install-service` now validates the persistent Python runtime, pins the
+  effective data/config directories into launchd/systemd definitions and runs
+  sweeps via `python -I -m ephemdir`.
+- Generated names, parent validation, registry loading and scheduled sweep
+  setup now fail closed when ownership, symlink, mount or file-type checks are
+  ambiguous.
+
+### Fixed
+- Corrupt registries, future schemas and malformed individual entries now block
+  operations without replacing the active registry with empty state.
+- Foreign-platform or unsupported-backend entries are preserved instead of
+  being pruned as stale.
+- POSIX deletion and size scanning share fd-relative identity and mount-boundary
+  checks, including crash/recovery handling for interrupted deletions.
+- `--force` no longer bypasses in-use, ownership, identity, backend or platform
+  safety gates.
+
+### Tests
+- External POSIX audit passed for v0.5.0 release.
+- Local release gate covers ruff, mypy strict, pytest, source coverage at 90%,
+  build/twine checks, clean wheel install and extracted-zip tests.
+
 ## [0.4.0] - 2026-06-14
 
 ### Added
