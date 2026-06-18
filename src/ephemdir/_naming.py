@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import secrets
 
-__all__ = ["funny_name"]
+__all__ = ["clean_name", "funny_name"]
 
 _FALLBACK_ADJECTIVES = (
     "agile", "amber", "bold", "brave", "bright", "brisk", "calm", "clever",
@@ -65,6 +65,24 @@ def funny_name(words: int = 2, separator: str = "-") -> str:
     parts = [secrets.choice(_FALLBACK_ADJECTIVES) for _ in range(words - 1)]
     parts.append(secrets.choice(_FALLBACK_NOUNS))
     parts.append(secrets.token_hex(_SUFFIX_BYTES))
+    name = separator.join(parts)
+    if not name or name in {".", ".."} or os.path.isabs(name):
+        raise ValueError("generated name is not a safe path component")
+    return name
+
+
+def clean_name(words: int = 2, separator: str = "-") -> str:
+    """Return a readable name without the random suffix.
+
+    Callers may use this only after proving the parent directory is private to
+    the current user; otherwise the finite wordlist is vulnerable to namespace
+    exhaustion by another local user.
+    """
+    if not isinstance(words, int) or isinstance(words, bool) or not 1 <= words <= 4:
+        raise ValueError("words must be an integer between 1 and 4")
+    _validate_separator(separator)
+    parts = [secrets.choice(_FALLBACK_ADJECTIVES) for _ in range(words - 1)]
+    parts.append(secrets.choice(_FALLBACK_NOUNS))
     name = separator.join(parts)
     if not name or name in {".", ".."} or os.path.isabs(name):
         raise ValueError("generated name is not a safe path component")

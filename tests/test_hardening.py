@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import sys
 import time
 from pathlib import Path
@@ -20,7 +21,7 @@ import ephemdir._registry as registry_module
 import ephemdir.core as core
 from ephemdir._naming import funny_name
 from ephemdir._platform import user_data_dir
-from ephemdir._registry import Registry
+from ephemdir._registry import CorruptRegistryError, Registry
 from ephemdir.core import (
     _MARKER_NAME,
     _deletion_guard,
@@ -106,7 +107,7 @@ def test_write_marker_rejects_noncanonical_explicit_id(tmp_path):
 
 def test_replaced_directory_is_never_deleted(tmp_path, registry):
     # A directory deleted manually can be replaced at the same path before the
-    # sweep runs; the replacement must never be removed.
+    # sweep runs; the replacement must never be removed or silently untracked.
     d = tempdir(lifetime="1h", parent=tmp_path, registry=registry)
     shutil.rmtree(d.path)
     impostor = d.path
@@ -116,7 +117,7 @@ def test_replaced_directory_is_never_deleted(tmp_path, registry):
 
     assert sweep(registry=registry) == 0
     assert (impostor / "precious.txt").read_text() == "user data"
-    assert str(d.path) not in registered(registry=registry)  # stale entry dropped
+    assert str(d.path) in registered(registry=registry)
 
 
 def test_tampered_marker_blocks_deletion(tmp_path, registry):
@@ -312,7 +313,11 @@ def test_stale_lock_file_does_not_block(tmp_path):
 
     start = time.monotonic()
     with registry.transaction() as state:
-        state["probe"] = {"created_at": 1.0}
+        state[str(tmp_path / "probe")] = {
+            "created_at": 1.0,
+            "expires_at": None,
+            "remove_on_restart": True,
+        }
     assert time.monotonic() - start < 1.0
 
 
@@ -324,11 +329,15 @@ def test_corrupt_registry_is_quarantined(tmp_path):
     path.chmod(0o600)
     reg = Registry(path=path)
 
-    # An unlocked read just reports empty; quarantine happens under the lock.
-    assert reg.load() == {}
+    # Unlocked reads fail closed without creating a new empty registry.
+    with pytest.raises(CorruptRegistryError):
+        reg.load()
     assert path.exists()
-    with reg.transaction():
-        pass
+    with pytest.raises(CorruptRegistryError):
+        with reg.transaction():
+            pass
+    assert path.exists()
+    assert path.read_text(encoding="utf-8") == "{ this is not json"
     assert list(tmp_path.glob("registry.json.corrupt-*"))
 
 
@@ -339,13 +348,70 @@ def test_nan_in_registry_is_treated_as_corrupt(tmp_path):
     path.chmod(0o600)
     reg = Registry(path=path)
 
-    assert reg.load() == {}
-    with reg.transaction():
-        pass
+    with pytest.raises(CorruptRegistryError):
+        reg.load()
+    with pytest.raises(CorruptRegistryError):
+        with reg.transaction():
+            pass
+    assert path.exists()
     assert list(tmp_path.glob("registry.json.corrupt-*"))
 
 
-def test_malformed_entries_are_dropped(tmp_path):
+def test_corrupt_registry_blocks_repeated_sweeps_without_losing_tracking(tmp_path):
+    registry = Registry(path=tmp_path / "registry.json")
+    directory = tempdir(parent=tmp_path / "work", registry=registry)
+    registry.path.write_text("{broken", encoding="utf-8")
+    registry.path.chmod(0o600)
+
+    for _ in range(2):
+        with pytest.raises(CorruptRegistryError):
+            sweep(registry=registry)
+
+    assert registry.path.read_text(encoding="utf-8") == "{broken"
+    assert directory.path.exists()
+    assert list(tmp_path.glob("registry.json.corrupt-*"))
+
+
+def test_malformed_entry_blocks_repeated_sweeps_without_orphaning_valid_entries(
+    tmp_path,
+):
+    registry = Registry(path=tmp_path / "registry.json")
+    first = tempdir(parent=tmp_path / "work", registry=registry)
+    second = tempdir(parent=tmp_path / "work", registry=registry)
+    state = registry.load(read_only=True)
+    state[str(first.path)]["marker_id"] = "broken"
+    registry.path.write_text(json.dumps(state), encoding="utf-8")
+    registry.path.chmod(0o600)
+    original = registry.path.read_bytes()
+
+    for _ in range(2):
+        with pytest.raises(CorruptRegistryError):
+            sweep(registry=registry)
+
+    assert registry.path.read_bytes() == original
+    assert first.path.exists()
+    assert second.path.exists()
+    quarantines = list(tmp_path.glob("registry.json.corrupt-*"))
+    assert quarantines
+    assert quarantines[0].read_bytes() == original
+
+
+def test_tempdir_after_corrupt_registry_does_not_create_directory(tmp_path):
+    registry = Registry(path=tmp_path / "registry.json")
+    parent = tmp_path / "work"
+    parent.mkdir()
+    registry.path.parent.mkdir(exist_ok=True)
+    registry.path.write_text("{broken", encoding="utf-8")
+    registry.path.chmod(0o600)
+
+    with pytest.raises(CorruptRegistryError):
+        tempdir(parent=parent, registry=registry)
+
+    assert list(parent.iterdir()) == []
+    assert registry.path.read_text(encoding="utf-8") == "{broken"
+
+
+def test_malformed_entry_blocks_entire_registry(tmp_path):
     path = tmp_path / "registry.json"
     good = str(tmp_path / "good")
     payload = {
@@ -357,7 +423,17 @@ def test_malformed_entries_are_dropped(tmp_path):
     path.write_text(json.dumps(payload), encoding="utf-8")
     path.chmod(0o600)
 
-    assert set(Registry(path=path).load()) == {good}
+    with pytest.raises(CorruptRegistryError, match="relative/path"):
+        Registry(path=path).load(read_only=True)
+
+    original = path.read_bytes()
+    with pytest.raises(CorruptRegistryError):
+        with Registry(path=path).transaction():
+            pass
+    quarantines = list(tmp_path.glob("registry.json.corrupt-*"))
+    assert len(quarantines) == 1
+    assert quarantines[0].read_bytes() == original
+    assert path.read_bytes() == original
 
 
 def test_empty_registry_entry_is_rejected(tmp_path):
@@ -370,7 +446,8 @@ def test_empty_registry_entry_is_rejected(tmp_path):
     path.write_text(json.dumps({str(victim): {}}), encoding="utf-8")
     path.chmod(0o600)
 
-    assert Registry(path=path).load() == {}
+    with pytest.raises(CorruptRegistryError):
+        Registry(path=path).load(read_only=True)
     assert (victim / "doc.txt").read_text() == "data"
 
 
@@ -408,14 +485,41 @@ def test_registry_save_rejects_symlinked_data_directory(tmp_path):
         reg.save({})
 
 
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlink support required")
+def test_registry_load_rejects_symlinked_state_ancestor(tmp_path):
+    real_data = tmp_path / "real-data"
+    real_data.mkdir()
+    linked_data = tmp_path / "linked-data"
+    linked_data.symlink_to(real_data, target_is_directory=True)
+
+    reg = Registry(path=linked_data / "state" / "registry.json")
+    with pytest.raises(registry_module.RegistryUnavailableError):
+        reg.load(read_only=True)
+    assert not (real_data / "state" / "registry.json").exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlink support required")
+def test_registry_transaction_rejects_symlinked_state_ancestor(tmp_path):
+    real_data = tmp_path / "real-data"
+    real_data.mkdir()
+    linked_data = tmp_path / "linked-data"
+    linked_data.symlink_to(real_data, target_is_directory=True)
+
+    reg = Registry(path=linked_data / "state" / "registry.json")
+    with pytest.raises(PermissionError):
+        with reg.transaction():
+            pass
+    assert not (real_data / "state" / "registry.json").exists()
+
+
 def test_tempdir_leaves_owned_orphan_when_registration_fails(tmp_path, registry, monkeypatch):
     parent = tmp_path / "work"
     real_save = Registry.save
 
-    def failing_save(self, state):
+    def failing_save(self, state, **kwargs):
         if state:  # let the initial empty sweep through, fail the registration
             raise OSError("disk full")
-        return real_save(self, state)
+        return real_save(self, state, **kwargs)
 
     monkeypatch.setattr(Registry, "save", failing_save)
     with pytest.raises(OSError, match="disk full"):
@@ -451,13 +555,16 @@ def test_infinite_number_in_registry_entry_is_rejected(tmp_path):
     path.chmod(0o600)
     reg = Registry(path=path)
 
-    assert reg.load() == {}
-    with reg.transaction() as state:  # must not raise on save
-        state[str(tmp_path / "y")] = {
-            "created_at": 1.0,
-            "expires_at": None,
-            "remove_on_restart": True,
-        }
+    with pytest.raises(CorruptRegistryError):
+        reg.load(read_only=True)
+    original = path.read_bytes()
+    with pytest.raises(CorruptRegistryError):
+        with reg.transaction():
+            pass
+    quarantines = list(tmp_path.glob("registry.json.corrupt-*"))
+    assert len(quarantines) == 1
+    assert quarantines[0].read_bytes() == original
+    assert path.read_bytes() == original
 
 
 def test_stale_handle_cannot_extend_replacement_directory(tmp_path, registry):
@@ -503,12 +610,12 @@ def test_resolve_stale_snapshot_does_not_delete_new_entry(tmp_path, registry, mo
         "expires_at": None,
         "remove_on_restart": False,
         "keep_while_in_use": False,
-        "marker_id": "old-marker",
+        "marker_id": "a" * 32,
         "state": "active",
         "claim_id": None,
         "staging_path": None,
     }
-    new_entry = {**old_entry, "marker_id": "new-marker", "created_at": 2.0}
+    new_entry = {**old_entry, "marker_id": "b" * 32, "created_at": 2.0}
     with registry.transaction() as state:
         state[str(path)] = dict(old_entry)
 
@@ -526,14 +633,14 @@ def test_resolve_stale_snapshot_does_not_delete_new_entry(tmp_path, registry, mo
         return real_path_state(probed)
 
     monkeypatch.setattr(core, "_path_state", racing_path_state)
-    with pytest.raises(LookupError, match="changed while resolving"):
+    with pytest.raises(LookupError, match="currently missing"):
         core.resolve(path.name, registry=registry)
 
     assert registered(registry=registry)[str(path)] == new_entry
     assert path.is_dir()
 
 
-def test_keep_extend_remove_refuse_changed_entry_after_resolve(tmp_path, registry, monkeypatch):
+def test_keep_refuses_changed_entry_after_probe(tmp_path, registry, monkeypatch):
     path = tmp_path / "same-name"
     path.mkdir()
     old_entry = {
@@ -541,12 +648,45 @@ def test_keep_extend_remove_refuse_changed_entry_after_resolve(tmp_path, registr
         "expires_at": None,
         "remove_on_restart": False,
         "keep_while_in_use": False,
-        "marker_id": "old-marker",
+        "marker_id": "c" * 32,
         "state": "active",
         "claim_id": None,
         "staging_path": None,
     }
-    new_entry = {**old_entry, "marker_id": "new-marker", "created_at": 2.0}
+    new_entry = {**old_entry, "marker_id": "d" * 32, "created_at": 2.0}
+    with registry.transaction() as state:
+        state[str(path)] = dict(old_entry)
+
+    real_path_state = core._path_state
+
+    def racing_path_state(probed):
+        if probed == path:
+            with registry.transaction() as state:
+                state[str(path)] = dict(new_entry)
+            return "present"
+        return real_path_state(probed)
+
+    monkeypatch.setattr(core, "_path_state", racing_path_state)
+
+    with pytest.raises(LookupError):
+        keep(path.name, registry=registry)
+    assert registered(registry=registry)[str(path)] == new_entry
+
+
+def test_extend_remove_refuse_changed_entry_after_resolve(tmp_path, registry, monkeypatch):
+    path = tmp_path / "same-name"
+    path.mkdir()
+    old_entry = {
+        "created_at": 1.0,
+        "expires_at": None,
+        "remove_on_restart": False,
+        "keep_while_in_use": False,
+        "marker_id": "c" * 32,
+        "state": "active",
+        "claim_id": None,
+        "staging_path": None,
+    }
+    new_entry = {**old_entry, "marker_id": "d" * 32, "created_at": 2.0}
     with registry.transaction() as state:
         state[str(path)] = dict(new_entry)
 
@@ -556,8 +696,6 @@ def test_keep_extend_remove_refuse_changed_entry_after_resolve(tmp_path, registr
         lambda target, *, registry: (path, dict(old_entry)),
     )
 
-    with pytest.raises(LookupError):
-        keep(path.name, registry=registry)
     with pytest.raises(LookupError):
         extend(path.name, "2h", registry=registry)
     with pytest.raises(OSError, match="changed concurrently"):
@@ -578,7 +716,7 @@ def test_sweep_refuses_poisoned_entry_for_data_dir(registry):
         }
     assert sweep(registry=registry, force=True) == 0
     assert target.exists()
-    assert str(target) not in registered(registry=registry)  # poisoned entry dropped
+    assert str(target) in registered(registry=registry)  # unsafe entry stays blocked
 
 
 # --- The deleting flag must never bypass ownership ----------------------------
@@ -592,31 +730,31 @@ def test_deleting_state_does_not_bypass_ownership(tmp_path, registry):
 
     # Variant A: the entry's key IS the victim (original and "staging" both
     # exist) -> ambiguous, parked as recovery, nothing deleted.
-    with registry.transaction() as state:
-        state[str(victim)] = {
-            "created_at": 0.0,
-            "expires_at": None,
-            "remove_on_restart": False,
-            "state": "deleting",
-            "claim_id": None,
-            "staging_path": str(victim),
-        }
-    assert sweep(registry=registry, force=True) == 0
+    with pytest.raises(ValueError):
+        with registry.transaction() as state:
+            state[str(victim)] = {
+                "created_at": 0.0,
+                "expires_at": None,
+                "remove_on_restart": False,
+                "state": "deleting",
+                "claim_id": None,
+                "staging_path": str(victim),
+            }
     assert (victim / "doc.txt").read_text() == "data"
 
     # Variant B: staging_path points at the victim from a bogus key -> the
     # victim's name does not match ephemdir's staging shape -> left alone.
-    with registry.transaction() as state:
-        state.clear()
-        state[str(tmp_path / "nonexistent")] = {
-            "created_at": 0.0,
-            "expires_at": None,
-            "remove_on_restart": False,
-            "state": "deleting",
-            "claim_id": None,
-            "staging_path": str(victim),
-        }
-    assert sweep(registry=registry, force=True) == 0
+    with pytest.raises(ValueError):
+        with registry.transaction() as state:
+            state.clear()
+            state[str(tmp_path / "nonexistent")] = {
+                "created_at": 0.0,
+                "expires_at": None,
+                "remove_on_restart": False,
+                "state": "deleting",
+                "claim_id": None,
+                "staging_path": str(victim),
+            }
     assert (victim / "doc.txt").read_text() == "data"
 
 
@@ -714,6 +852,8 @@ def test_mount_boundary_mismatch_is_not_traversed(tmp_path, registry, monkeypatc
 
     mount_ids = iter([100, 100, 200])
     monkeypatch.setattr(core.sys, "platform", "linux")
+    with registry.transaction() as state:
+        state[str(d.path)]["platform"] = "linux"
     monkeypatch.setattr(core, "_mount_id_for_fd", lambda fd: next(mount_ids, 200))
 
     assert sweep(registry=registry) == 0
@@ -722,6 +862,30 @@ def test_mount_boundary_mismatch_is_not_traversed(tmp_path, registry, monkeypatc
     assert (Path(entry["staging_path"]) / "mounted" / "sentinel.txt").read_text(
         encoding="utf-8"
     ) == "external"
+
+
+def test_foreign_platform_journal_is_not_recovered(tmp_path, registry):
+    d = tempdir(lifetime="1h", parent=tmp_path, registry=registry)
+    staging = d.path.parent / f".{d.path.name}.123-abcdef12.deleting"
+    os.rename(d.path, staging)
+    with registry.transaction() as state:
+        entry = state[str(d.path)]
+        entry.update(
+            {
+                "state": "deleting",
+                "claim_id": None,
+                "staging_path": str(staging),
+                "platform": "win32",
+                "backend": "windows",
+            }
+        )
+
+    assert sweep(registry=registry) == 0
+
+    entry = registered(registry=registry)[str(d.path)]
+    assert entry["state"] == "deleting"
+    assert entry["platform"] == "win32"
+    assert staging.exists()
 
 
 def test_non_posix_delete_path_fails_closed(tmp_path, registry, monkeypatch):
@@ -746,6 +910,33 @@ def test_untrusted_non_sticky_parent_is_rejected(tmp_path, registry):
 
     with pytest.raises(PermissionError, match="without sticky bit"):
         tempdir(parent=parent, registry=registry)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+def test_foreign_owned_sticky_parent_is_rejected_by_policy(tmp_path):
+    parent = tmp_path / "shared"
+    parent.mkdir()
+    real = parent.stat()
+    values = list(real)
+    values[0] = stat.S_IFDIR | 0o1777
+    values[4] = os.geteuid() + 1
+    synthetic = os.stat_result(values)
+
+    assert core._trusted_component_error(parent, synthetic) is not None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+def test_root_owned_sticky_parent_is_accepted_by_policy(tmp_path):
+    parent = tmp_path / "shared"
+    parent.mkdir()
+    real = parent.stat()
+    values = list(real)
+    values[0] = stat.S_IFDIR | 0o1777
+    values[4] = 0
+    synthetic = os.stat_result(values)
+
+    assert core._trusted_component_error(parent, synthetic) is None
+    assert core._trusted_final_parent_error(parent, synthetic) is None
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
@@ -782,7 +973,7 @@ def _journal_intent(registry, path, staging):
     """Simulate the durable 'moving' intent as written by phase 1 of a claim."""
     with registry.transaction() as state:
         state[str(path)].update(
-            {"state": "moving", "claim_id": "test-claim", "staging_path": str(staging)}
+            {"state": "moving", "claim_id": "5" * 32, "staging_path": str(staging)}
         )
 
 
@@ -836,7 +1027,7 @@ def test_recovery_accepts_legacy_tree_returned_to_original(tmp_path, registry):
     staging = d.path.parent / f".{d.path.name}.123-abcdef12.deleting"
     with registry.transaction() as state:
         state[str(d.path)].update(
-            {"state": "deleting", "claim_id": "test-claim", "staging_path": str(staging)}
+            {"state": "deleting", "claim_id": "6" * 32, "staging_path": str(staging)}
         )
 
     assert sweep(registry=registry) == 0
@@ -845,14 +1036,15 @@ def test_recovery_accepts_legacy_tree_returned_to_original(tmp_path, registry):
     assert d.path.is_dir()
 
 
-def test_recovery_drops_entry_when_nothing_left_on_disk(tmp_path, registry):
+def test_recovery_preserves_entry_when_nothing_left_on_disk(tmp_path, registry):
     d = tempdir(parent=tmp_path, registry=registry)
     staging = d.path.parent / f".{d.path.name}.123-abcdef12.deleting"
     _journal_intent(registry, d.path, staging)
     shutil.rmtree(d.path)  # both original and staging are gone
 
     sweep(registry=registry)
-    assert registered(registry=registry) == {}
+    entry = registered(registry=registry)[str(d.path)]
+    assert entry["state"] == "recovery"
 
 
 # --- Per-directory deletion lock ------------------------------------------------
@@ -979,7 +1171,11 @@ def test_directories_are_owner_only(tmp_path, registry):
 def test_registry_file_is_owner_only(tmp_path):
     registry = Registry(path=tmp_path / "registry.json")
     with registry.transaction() as state:
-        state[str(tmp_path / "x")] = {"created_at": 1.0}
+        state[str(tmp_path / "x")] = {
+            "created_at": 1.0,
+            "expires_at": None,
+            "remove_on_restart": True,
+        }
     assert os.stat(registry.path).st_mode & 0o777 == 0o600
 
 

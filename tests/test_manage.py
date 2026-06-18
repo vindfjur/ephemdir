@@ -49,11 +49,21 @@ def test_resolve_ambiguous_prefix_raises(tmp_path, registry, monkeypatch):
         resolve("alpha", registry=registry)
 
 
-def test_resolve_missing_dir_prunes_and_raises(tmp_path, registry):
+def test_resolve_missing_dir_preserves_and_raises(tmp_path, registry):
     d = tempdir(parent=tmp_path, registry=registry)
     shutil.rmtree(d.path)  # deleted behind ephemdir's back
-    with pytest.raises(LookupError, match="no longer exists"):
+    with pytest.raises(LookupError, match="currently missing"):
         resolve(d.path.name, registry=registry)
+    assert str(d.path) in registered(registry=registry)
+
+
+def test_keep_missing_dir_explicitly_forgets(tmp_path, registry):
+    d = tempdir(parent=tmp_path, registry=registry)
+    shutil.rmtree(d.path)
+
+    kept = keep(d.path.name, registry=registry)
+
+    assert kept == d.path
     assert str(d.path) not in registered(registry=registry)
 
 

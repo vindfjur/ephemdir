@@ -42,6 +42,9 @@ _KEY_TYPES: dict[str, tuple[type, ...]] = {
     "parent": (str,),
     "prefix": (str,),
     "words": (int,),
+    "cleanup": (str,),
+    "max_size": (str, int, type(None)),
+    "name_style": (str,),
 }
 RECOGNIZED_KEYS = frozenset(_KEY_TYPES)
 

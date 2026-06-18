@@ -4,6 +4,62 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-06-18
+
+### Added
+- Added `cleanup="next-sweep"` / `ephemdir new --until-sweep` for directories
+  that are removed only by explicit full sweeps, watchers or schedulers.
+- Added `max_size` cleanup thresholds with bounded, mount-aware POSIX size
+  scanning.
+- Added `name_style=auto|clean|secure`; clean names are allowed only in
+  owner-private parent directories.
+- Added `ephemdir sweep --dry-run`, `ephemdir explain`, `ephemdir doctor`,
+  `ephemdir menu`, `ephemdir completion show` and completion script printing.
+- Added a registry v2 envelope with legacy flat-registry migration on the next
+  write.
+
+### Changed
+- v0.5.0 is a POSIX-only hardening release for Linux and macOS. Windows remains
+  intentionally unsupported until a handle-bound recursive deletion backend is
+  available.
+- `install-service` now validates the persistent Python runtime, pins the
+  effective data/config directories into launchd/systemd definitions and runs
+  sweeps via `python -I -m ephemdir`.
+- Generated names, parent validation, registry loading and scheduled sweep
+  setup now fail closed when ownership, symlink, mount or file-type checks are
+  ambiguous.
+- Missing active paths are now preserved by `sweep`, `sweep --dry-run`,
+  `list`, `list --json` and `explain` as `status=missing` with a
+  `path-missing` blocker instead of being silently forgotten.
+- `prune` is now the explicit command for forgetting missing active entries and
+  logs every forgotten path as `forgot missing tracked directory: ...`.
+- `doctor` reports the effective data/config directories, registry path,
+  environment-variable sources and the service-pinned environment used by
+  scheduled sweeps.
+- macOS/Linux service runtime errors now call out group/world-writable
+  components and include a safe uv-managed virtualenv recipe for scheduled
+  service installs.
+
+### Fixed
+- Corrupt registries, future schemas and malformed individual entries now block
+  operations without replacing the active registry with empty state.
+- Foreign-platform or unsupported-backend entries are preserved instead of
+  being pruned as stale.
+- POSIX deletion and size scanning share fd-relative identity and mount-boundary
+  checks, including crash/recovery handling for interrupted deletions.
+- `--force` no longer bypasses in-use, ownership, identity, backend or platform
+  safety gates.
+- Restart-due directories that are missing, inaccessible, replaced or in
+  recovery remain tracked until ephemdir verifies deletion or the user
+  explicitly forgets them.
+- Read-only CLI commands no longer mutate the registry, create empty registry
+  state, prune entries or quarantine corrupt files as a side effect.
+
+### Tests
+- External POSIX audit passed for v0.5.0 release.
+- Local release gate covers ruff, mypy strict, pytest, source coverage at 90%,
+  build/twine checks, clean wheel install and extracted-zip tests.
+
 ## [0.4.0] - 2026-06-14
 
 ### Added

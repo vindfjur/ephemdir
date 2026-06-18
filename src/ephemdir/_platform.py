@@ -12,6 +12,7 @@ import sys
 import time
 from pathlib import Path
 
+from ._security import ensure_private_directory
 from ._trusted_exec import minimal_subprocess_env, resolve_system_executable, stable_subprocess_cwd
 
 __all__ = ["user_data_dir", "user_config_dir", "boot_time", "boot_session_id", "same_boot"]
@@ -23,7 +24,33 @@ __all__ = ["user_data_dir", "user_config_dir", "boot_time", "boot_session_id", "
 _BOOT_TOLERANCE_SECONDS = 120.0
 
 
-def user_data_dir(app_name: str = "ephemdir") -> Path:
+def _user_private_dir(path: Path, *, create: bool) -> Path:
+    """Return an absolute private app directory, creating it safely if asked."""
+    absolute = _canonical_private_dir_path(path)
+    if create:
+        ensure_private_directory(absolute)
+    return absolute
+
+
+def _canonical_private_dir_path(path: Path) -> Path:
+    """Return a stable absolute app-state path without following user symlinks.
+
+    macOS exposes ``/var`` as a root-owned system symlink to ``/private/var``.
+    Shell helpers such as ``mktemp`` commonly return paths under ``/var``, but
+    ephemdir's state-directory trust walk intentionally rejects symlink
+    components.  Normalize that one platform alias lexically; do not call
+    ``realpath`` on the whole path, because that would also resolve arbitrary
+    user-controlled symlinks inside shared temporary directories.
+    """
+    absolute = Path(os.path.abspath(path))
+    if sys.platform == "darwin":
+        parts = absolute.parts
+        if len(parts) >= 2 and parts[0] == "/" and parts[1] == "var":
+            return Path("/private", *parts[1:])
+    return absolute
+
+
+def user_data_dir(app_name: str = "ephemdir", *, create: bool = True) -> Path:
     """Return the per-user data directory for ``app_name``.
 
     Follows the platform conventions:
@@ -37,9 +64,7 @@ def user_data_dir(app_name: str = "ephemdir") -> Path:
     """
     override = os.environ.get("EPHEMDIR_DATA_DIR")
     if override:
-        path = Path(override)
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        return path
+        return _user_private_dir(Path(override), create=create)
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
         root = Path(base) if base else Path.home() / "AppData" / "Local"
@@ -51,11 +76,10 @@ def user_data_dir(app_name: str = "ephemdir") -> Path:
 
     path = root / app_name
     # The registry may reference private paths, so keep the dir owner-only.
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return path
+    return _user_private_dir(path, create=create)
 
 
-def user_config_dir(app_name: str = "ephemdir") -> Path:
+def user_config_dir(app_name: str = "ephemdir", *, create: bool = True) -> Path:
     """Return the per-user configuration directory for ``app_name``.
 
     Follows the platform conventions:
@@ -69,9 +93,7 @@ def user_config_dir(app_name: str = "ephemdir") -> Path:
     """
     override = os.environ.get("EPHEMDIR_CONFIG_DIR")
     if override:
-        path = Path(override)
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        return path
+        return _user_private_dir(Path(override), create=create)
     if sys.platform == "win32":
         base = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
         root = Path(base) if base else Path.home() / "AppData" / "Roaming"
@@ -82,8 +104,7 @@ def user_config_dir(app_name: str = "ephemdir") -> Path:
         root = Path(base) if base else Path.home() / ".config"
 
     path = root / app_name
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return path
+    return _user_private_dir(path, create=create)
 
 
 def boot_session_id() -> str | None:
@@ -168,13 +189,14 @@ def _boot_time_linux() -> float | None:
 
 def _boot_time_macos() -> float | None:
     """Read the exact boot time from ``sysctl kern.boottime`` on macOS/BSD."""
-    import subprocess
+    # sysctl is resolved from trusted system directories and run without a shell.
+    import subprocess  # nosec B404
 
     executable = resolve_system_executable("sysctl")
     if executable is None:
         return None
     try:
-        output = subprocess.check_output(
+        output = subprocess.check_output(  # nosec B603
             [executable, "-n", "kern.boottime"],
             stderr=subprocess.DEVNULL,
             text=True,

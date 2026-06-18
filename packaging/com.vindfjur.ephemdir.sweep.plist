@@ -12,7 +12,9 @@
   It sweeps once at login (RunAtLoad) and then every 600 seconds. The job runs
   `python -I -m ephemdir` from / with a fixed PATH so neither the working
   directory, PYTHONPATH/PYTHONHOME nor a polluted PATH can substitute the
-  imported package.
+  imported package. If you use custom state/config locations, add absolute
+  EPHEMDIR_DATA_DIR and EPHEMDIR_CONFIG_DIR values below; `ephemdir
+  install-service` fills them in automatically.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">

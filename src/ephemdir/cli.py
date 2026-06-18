@@ -9,7 +9,7 @@ Exposes the library through a small ``ephemdir`` command:
 * ``ephemdir extend``     -- give a directory a fresh lifetime
 * ``ephemdir rm``         -- remove a tracked directory now
 * ``ephemdir sweep``      -- remove every directory that is due for cleanup
-* ``ephemdir prune``      -- forget entries whose directories were deleted manually
+* ``ephemdir prune``      -- forget missing tracked directories explicitly
 * ``ephemdir watch``      -- run a foreground loop that sweeps periodically
 * ``ephemdir shell-init`` -- print shell functions (``ecd``, ``enew``) to eval
 """
@@ -28,15 +28,21 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from . import __version__
+from ._completion import completion_script
+from ._display import escape_human_text, format_decision
+from ._doctor import run_doctor
+from ._menu import run_menu
 from ._platform import boot_session_id, boot_time
-from ._registry import Entry, UnsafeRegistryError
+from ._registry import Entry, RegistryFormatError, RegistryUnavailableError, UnsafeRegistryError
 from ._service import ServiceError, install_service, uninstall_service
 from .core import (
     _UNSET,
     _path_state,
     dir_status,
+    explain,
     extend,
     keep,
+    plan_sweep,
     prune,
     recover,
     registered,
@@ -55,6 +61,7 @@ _ICONS = {
     "expiring": "🟡",
     "expired": "🔴",
     "until-restart": "🔄",
+    "until-sweep": "🧹",
     "kept": "📌",
     "missing": "👻",
     "replaced": "⚠️",
@@ -62,19 +69,22 @@ _ICONS = {
     "deleting": "🗑️",
     "recovery": "🚧",
     "unavailable": "❓",
+    "blocked": "⛔",
 }
 _ASCII_ICONS = {
     "active": "[ok]  ",
     "expiring": "[soon]",
     "expired": "[due] ",
     "until-restart": "[boot]",
+    "until-sweep": "[swp] ",
     "kept": "[pin] ",
-    "missing": "[gone]",
+    "missing": "[miss]",
     "replaced": "[warn]",
     "legacy": "[old] ",
     "deleting": "[del] ",
     "recovery": "[rec] ",
     "unavailable": "[n/a] ",
+    "blocked": "[blk] ",
 }
 
 # Shell snippets emitted by `ephemdir shell-init`. A subprocess cannot change
@@ -126,6 +136,14 @@ _SHELL_SNIPPETS = {
 }
 
 
+class _NoAbbrevArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser variant that never accepts abbreviated long options."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("allow_abbrev", False)
+        super().__init__(*args, **kwargs)
+
+
 def _configure_logging(verbosity: int, quiet: bool) -> None:
     """Set up output verbosity for the CLI run.
 
@@ -168,7 +186,7 @@ def _format_duration(seconds: float) -> str:
 def _status_note(status: str, entry: Entry, now: float) -> str:
     """One short human phrase describing what happens to the directory next."""
     if status == "missing":
-        return "gone (deleted manually)"
+        return "missing; still tracked"
     if status == "replaced":
         return "replaced by another directory; will not be touched"
     if status == "legacy":
@@ -179,10 +197,21 @@ def _status_note(status: str, entry: Entry, now: float) -> str:
         return "interrupted deletion; use ephemdir recover"
     if status == "unavailable":
         return "temporarily inaccessible; still tracked"
+    if status == "blocked":
+        blockers = []
+        backend = entry.get("backend")
+        if isinstance(backend, str) and backend != "posix":
+            blockers.append("unsupported backend")
+        platform = entry.get("platform")
+        if isinstance(platform, str) and platform != sys.platform:
+            blockers.append("foreign platform")
+        return "; ".join(blockers) if blockers else "blocked"
     if status == "kept":
         return "no auto-cleanup"
     if status == "until-restart":
         return "until restart"
+    if status == "until-sweep":
+        return "until next full sweep"
     expires_at = entry.get("expires_at")
     if status == "expired":
         if isinstance(expires_at, (int, float)) and now >= float(expires_at):
@@ -225,6 +254,14 @@ def _cmd_new(args: argparse.Namespace) -> int:
         kwargs["remove_on_restart"] = not args.keep_on_restart
     if args.keep_while_in_use is not _UNSET:
         kwargs["keep_while_in_use"] = args.keep_while_in_use
+    if args.cleanup is not _UNSET:
+        kwargs["cleanup"] = args.cleanup
+    if args.until_sweep is not _UNSET:
+        kwargs["cleanup"] = "next-sweep"
+    if args.max_size is not _UNSET:
+        kwargs["max_size"] = args.max_size
+    if args.name_style is not _UNSET:
+        kwargs["name_style"] = args.name_style
 
     try:
         directory = tempdir(**kwargs)
@@ -239,9 +276,55 @@ def _cmd_new(args: argparse.Namespace) -> int:
 
 
 def _cmd_sweep(args: argparse.Namespace) -> int:
+    if args.dry_run:
+        decisions = plan_sweep(force=args.force)
+        count = 0
+        for decision in decisions:
+            if decision.due:
+                print(format_decision(decision))
+                if decision.destructive_allowed:
+                    count += 1
+        logger.warning("would sweep %d director%s", count, "y" if count == 1 else "ies")
+        return 0
     count = sweep(force=args.force)
     logger.warning("swept %d director%s", count, "y" if count == 1 else "ies")
     return 0
+
+
+def _cmd_explain(args: argparse.Namespace) -> int:
+    try:
+        decision = explain(args.target)
+    except LookupError as error:
+        logger.error("%s", error)
+        return 1
+    print(format_decision(decision))
+    return 0
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    checks = run_doctor()
+    if args.json:
+        print(json.dumps([check.__dict__ for check in checks], indent=2))
+    else:
+        for check in checks:
+            status = "ok" if check.ok else "fail"
+            print(f"{status:<4} {check.name:<12} {check.message}")
+            if check.hint:
+                print(f"     hint: {check.hint}")
+    return 0 if all(check.ok for check in checks) else 1
+
+
+def _cmd_completion(args: argparse.Namespace) -> int:
+    try:
+        print(completion_script(args.shell), end="")
+    except ValueError as error:
+        logger.error("%s", error)
+        return 2
+    return 0
+
+
+def _cmd_menu(args: argparse.Namespace) -> int:
+    return run_menu(lambda argv: main(argv))
 
 
 def _cmd_list(args: argparse.Namespace) -> int:
@@ -297,7 +380,10 @@ def _cmd_list(args: argparse.Namespace) -> int:
     notes = [_status_note(status, entry, now) for _, entry, status in rows]
     note_width = max(len(note) for note in notes)
     for (path, _, status), note in zip(rows, notes, strict=True):
-        print(f"{icons[status]} {path.name:<{name_width}}  {note:<{note_width}}  {path}")
+        print(
+            f"{icons[status]} {escape_human_text(path.name):<{name_width}}  "
+            f"{note:<{note_width}}  {escape_human_text(path)}"
+        )
     return 0
 
 
@@ -384,7 +470,7 @@ def _cmd_recover(args: argparse.Namespace) -> int:
 
 def _cmd_prune(args: argparse.Namespace) -> int:
     count = prune()
-    logger.warning("pruned %d stale entr%s", count, "y" if count == 1 else "ies")
+    logger.warning("pruned %d missing entr%s", count, "y" if count == 1 else "ies")
     return 0
 
 
@@ -438,7 +524,7 @@ def _cmd_uninstall_service(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     """Construct the argument parser for the ``ephemdir`` command."""
-    parser = argparse.ArgumentParser(
+    parser = _NoAbbrevArgumentParser(
         prog="ephemdir",
         description="Create self-cleaning ephemeral directories.",
     )
@@ -446,7 +532,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-v", "--verbose", action="count", default=0, help="increase verbosity")
     parser.add_argument("-q", "--quiet", action="store_true", help="only report errors")
 
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(
+        dest="command",
+        required=True,
+        parser_class=_NoAbbrevArgumentParser,
+    )
 
     # Unset options default to the _UNSET sentinel so they can be resolved from
     # the user config file rather than always overriding it.
@@ -457,6 +547,14 @@ def build_parser() -> argparse.ArgumentParser:
                      help="do not remove the directory after a restart")
     new.add_argument("--keep-while-in-use", action="store_const", const=True, default=_UNSET,
                      help="do not delete while files are still open inside")
+    new.add_argument("--cleanup", choices=["auto", "next-sweep"], default=_UNSET,
+                     help="cleanup policy (auto or next-sweep)")
+    new.add_argument("--until-sweep", action="store_const", const=True, default=_UNSET,
+                     help="keep until an explicit full sweep")
+    new.add_argument("--max-size", default=_UNSET,
+                     help='remove once directory exceeds this size, e.g. "2GiB"')
+    new.add_argument("--name-style", choices=["auto", "clean", "secure", "funny"], default=_UNSET,
+                     help="generated name style")
     new.add_argument("-p", "--parent", default=_UNSET,
                      help="where to create the directory (default: current directory)")
     new.add_argument("--prefix", default=_UNSET, help="prefix for the generated name")
@@ -498,10 +596,47 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_cmd = sub.add_parser("sweep", help="remove directories that are due for cleanup")
     sweep_cmd.add_argument("--force", action="store_true",
                            help="remove every tracked directory regardless of policy")
+    sweep_cmd.add_argument("--dry-run", action="store_true",
+                           help="preview what would be removed without deleting anything")
     sweep_cmd.set_defaults(func=_cmd_sweep)
 
+    explain_cmd = sub.add_parser("explain", help="explain cleanup state for a directory")
+    explain_cmd.add_argument("target", help="directory name, unique prefix or path")
+    explain_cmd.set_defaults(func=_cmd_explain)
+
+    doctor_cmd = sub.add_parser("doctor", help="diagnose ephemdir safety prerequisites")
+    doctor_cmd.add_argument("--json", action="store_true", help="machine-readable output")
+    doctor_cmd.set_defaults(func=_cmd_doctor)
+
+    completion = sub.add_parser("completion", help="print shell completion scripts")
+    completion_sub = completion.add_subparsers(
+        dest="completion_command",
+        required=True,
+        parser_class=_NoAbbrevArgumentParser,
+    )
+    for command, help_text in (
+        ("install", "print a completion script; does not modify shell startup files"),
+        ("show", "print a completion script"),
+    ):
+        completion_print = completion_sub.add_parser(
+            command,
+            help=help_text,
+            description=help_text,
+        )
+        completion_print.add_argument(
+            "shell",
+            nargs="?",
+            choices=["bash", "zsh", "fish", "powershell"],
+            default=_detect_shell(),
+            help="shell to target",
+        )
+        completion_print.set_defaults(func=_cmd_completion)
+
+    menu = sub.add_parser("menu", help="open an interactive text menu")
+    menu.set_defaults(func=_cmd_menu)
+
     prune_cmd = sub.add_parser(
-        "prune", help="forget entries whose directories were deleted manually")
+        "prune", help="forget missing tracked directories explicitly")
     prune_cmd.set_defaults(func=_cmd_prune)
 
     recover_cmd = sub.add_parser(
@@ -552,6 +687,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     except UnsafeRegistryError as error:
         # The registry is writable by other users and was left untouched: a
         # clear message, not a traceback, and definitely no destructive action.
+        logger.error("%s", error)
+        return 1
+    except PermissionError as error:
+        logger.error("%s", error)
+        return 1
+    except (RegistryFormatError, RegistryUnavailableError) as error:
         logger.error("%s", error)
         return 1
     return exit_code

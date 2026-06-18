@@ -32,18 +32,52 @@ def test_live_moving_claim_is_not_recovered_while_deletion_lock_is_held(tmp_path
         # before it renames the directory.
         with registry.transaction() as state:
             state[str(d.path)].update(
-                {"state": "moving", "claim_id": "live-claim", "staging_path": str(staging)}
+                {"state": "moving", "claim_id": "1" * 32, "staging_path": str(staging)}
             )
         assert sweep(registry=registry) == 0
         live = registered(registry=registry)[str(d.path)]
         assert live["state"] == "moving"
-        assert live["claim_id"] == "live-claim"
+        assert live["claim_id"] == "1" * 32
 
     # Once the claimant is gone, recovery may safely decide that rename never
     # happened and reactivate the entry.  It is not deleted in that same pass.
     assert sweep(registry=registry) == 0
     assert registered(registry=registry)[str(d.path)]["state"] == "active"
     assert d.path.is_dir()
+
+
+def test_dry_run_counts_auto_resumable_deleting_entry(tmp_path, registry):
+    d = tempdir(lifetime="1h", parent=tmp_path, registry=registry)
+    staging = d.path.parent / f".{d.path.name}.123-abcdef12.deleting"
+    os.rename(d.path, staging)
+    with registry.transaction() as state:
+        state[str(d.path)].update(
+            {"state": "deleting", "claim_id": None, "staging_path": str(staging)}
+        )
+
+    decision = next(item for item in core.plan_sweep(registry=registry) if item.path == d.path)
+
+    assert decision.destructive_allowed is True
+    assert sweep(registry=registry, dry_run=True) == 1
+    assert staging.exists()
+    assert registered(registry=registry)[str(d.path)]["state"] == "deleting"
+
+
+def test_dry_run_blocks_ambiguous_recovery_entry(tmp_path, registry):
+    d = tempdir(lifetime="1h", parent=tmp_path, registry=registry)
+    staging = d.path.parent / f".{d.path.name}.123-abcdef12.deleting"
+    os.rename(d.path, staging)
+    with registry.transaction() as state:
+        state[str(d.path)].update(
+            {"state": "recovery", "claim_id": None, "staging_path": str(staging)}
+        )
+
+    decision = next(item for item in core.plan_sweep(registry=registry) if item.path == d.path)
+
+    assert decision.destructive_allowed is False
+    assert "recovery-required" in decision.blockers
+    assert sweep(registry=registry, dry_run=True) == 0
+    assert staging.exists()
 
 
 def test_partial_delete_never_replaces_new_original_directory(tmp_path, registry, monkeypatch):
@@ -75,7 +109,7 @@ def test_registration_failure_does_not_delete_replacement(tmp_path, registry, mo
     real_save = Registry.save
     replacement: Path | None = None
 
-    def fail_registration(self, state):
+    def fail_registration(self, state, **kwargs):
         nonlocal replacement
         if state:
             path = Path(next(iter(state)))
@@ -84,7 +118,7 @@ def test_registration_failure_does_not_delete_replacement(tmp_path, registry, mo
             (path / "innocent.txt").write_text("foreign")
             replacement = path
             raise OSError("disk full")
-        return real_save(self, state)
+        return real_save(self, state, **kwargs)
 
     monkeypatch.setattr(Registry, "save", fail_registration)
     with pytest.raises(OSError, match="disk full"):
@@ -99,7 +133,7 @@ def test_recovery_deletes_owned_staging_but_leaves_foreign_original(tmp_path, re
     staging = d.path.parent / f".{d.path.name}.123-abcdef12.deleting"
     with registry.transaction() as state:
         state[str(d.path)].update(
-            {"state": "moving", "claim_id": "dead", "staging_path": str(staging)}
+            {"state": "moving", "claim_id": "2" * 32, "staging_path": str(staging)}
         )
     os.replace(d.path, staging)
     d.path.mkdir()
@@ -182,7 +216,7 @@ def test_recover_forget_cannot_race_live_claim(tmp_path, registry):
     staging = d.path.parent / f".{d.path.name}.123-abcdef12.deleting"
     with registry.transaction() as state:
         state[str(d.path)].update(
-            {"state": "moving", "claim_id": "live", "staging_path": str(staging)}
+            {"state": "moving", "claim_id": "3" * 32, "staging_path": str(staging)}
         )
     lock_key = core._deletion_lock_key(str(d.path), entry)
     with registry.deletion_lock(lock_key) as acquired:
@@ -198,7 +232,7 @@ def test_journal_recovery_applies_deletion_guard(tmp_path, registry, monkeypatch
     staging = d.path.parent / f".{d.path.name}.123-abcdef12.deleting"
     with registry.transaction() as state:
         state[str(d.path)].update(
-            {"state": "moving", "claim_id": "dead", "staging_path": str(staging)}
+            {"state": "moving", "claim_id": "4" * 32, "staging_path": str(staging)}
         )
     monkeypatch.setattr(core, "_deletion_guard", lambda path: "test critical path")
     assert sweep(registry=registry) == 0
