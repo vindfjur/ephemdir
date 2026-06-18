@@ -17,14 +17,14 @@ anything on unsupported platforms. The package has no third-party runtime
 dependencies on Python 3.11+; Python 3.10 uses `tomli` only for TOML
 configuration parsing.
 
-v0.5.1 is a POSIX-only hotfix release. It keeps the v0.5 hardening work and
-adds stricter restart/recovery tracking: missing paths are reported and kept
-tracked until ephemdir verifies deletion or you explicitly forget them.
+v0.5.0 is a POSIX-only hardening release. It adds stricter restart/recovery
+tracking: missing paths are reported and kept tracked until ephemdir verifies
+deletion or you explicitly forget them.
 
 ## Installation
 
 > [!IMPORTANT]
-> Windows is **not supported in ephemdir 0.5.1**. The package may install on
+> Windows is **not supported in ephemdir 0.5.0**. The package may install on
 > Windows, but `tempdir()` and `ephemdir new` fail before creating anything
 > because Python does not expose the safe handle-bound recursive deletion
 > primitives ephemdir requires. Supported platforms are Linux and macOS.

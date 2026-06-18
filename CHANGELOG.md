@@ -4,28 +4,6 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.1] - 2026-06-18
-
-### Changed
-- Missing active paths are now preserved by `sweep`, `sweep --dry-run`,
-  `list`, `list --json` and `explain` as `status=missing` with a
-  `path-missing` blocker instead of being silently forgotten.
-- `prune` is now the explicit command for forgetting missing active entries and
-  logs every forgotten path as `forgot missing tracked directory: ...`.
-- `doctor` reports the effective data/config directories, registry path,
-  environment-variable sources and the service-pinned environment used by
-  scheduled sweeps.
-- macOS/Linux service runtime errors now call out group/world-writable
-  components and include a safe uv-managed virtualenv recipe for scheduled
-  service installs.
-
-### Fixed
-- Restart-due directories that are missing, inaccessible, replaced or in
-  recovery remain tracked until ephemdir verifies deletion or the user
-  explicitly forgets them.
-- Read-only CLI commands no longer mutate the registry, create empty registry
-  state, prune entries or quarantine corrupt files as a side effect.
-
 ## [0.5.0] - 2026-06-18
 
 ### Added
@@ -50,6 +28,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Generated names, parent validation, registry loading and scheduled sweep
   setup now fail closed when ownership, symlink, mount or file-type checks are
   ambiguous.
+- Missing active paths are now preserved by `sweep`, `sweep --dry-run`,
+  `list`, `list --json` and `explain` as `status=missing` with a
+  `path-missing` blocker instead of being silently forgotten.
+- `prune` is now the explicit command for forgetting missing active entries and
+  logs every forgotten path as `forgot missing tracked directory: ...`.
+- `doctor` reports the effective data/config directories, registry path,
+  environment-variable sources and the service-pinned environment used by
+  scheduled sweeps.
+- macOS/Linux service runtime errors now call out group/world-writable
+  components and include a safe uv-managed virtualenv recipe for scheduled
+  service installs.
 
 ### Fixed
 - Corrupt registries, future schemas and malformed individual entries now block
@@ -60,6 +49,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checks, including crash/recovery handling for interrupted deletions.
 - `--force` no longer bypasses in-use, ownership, identity, backend or platform
   safety gates.
+- Restart-due directories that are missing, inaccessible, replaced or in
+  recovery remain tracked until ephemdir verifies deletion or the user
+  explicitly forgets them.
+- Read-only CLI commands no longer mutate the registry, create empty registry
+  state, prune entries or quarantine corrupt files as a side effect.
 
 ### Tests
 - External POSIX audit passed for v0.5.0 release.

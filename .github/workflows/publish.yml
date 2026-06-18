@@ -8,6 +8,12 @@ name: Publish to PyPI
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to publish, for example v0.5.0"
+        required: true
+        type: string
 
 jobs:
   lint:
@@ -89,7 +95,7 @@ jobs:
           python-version: "3.12"
       - name: Verify release tag matches package version
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: |
           python - <<'PY'
           import os
