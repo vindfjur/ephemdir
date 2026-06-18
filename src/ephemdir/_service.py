@@ -25,7 +25,7 @@ import os
 import plistlib
 import site
 import stat
-import subprocess
+import subprocess  # nosec B404
 import sys
 import uuid
 from collections.abc import Iterator
@@ -36,6 +36,8 @@ from ._security import open_private_directory
 from ._trusted_exec import resolve_executable_in_dirs, trusted_system_dirs
 
 __all__ = ["ServiceError", "install_service", "uninstall_service", "sweep_command"]
+
+# Scheduler/runtime subprocesses use fixed argv, trusted resolution and no shell.
 
 logger = logging.getLogger("ephemdir")
 
@@ -272,6 +274,19 @@ def _writable_by_other_users(mode: int) -> bool:
     return bool(mode & (stat.S_IWGRP | stat.S_IWOTH))
 
 
+def _safe_uv_runtime_hint() -> str:
+    return (
+        " Scheduled services run this interpreter later, so a "
+        "group/world-writable component could be replaced by another local "
+        "user. Install a safe uv-managed environment under your home directory "
+        "instead:\n"
+        "  uv python install 3.12\n"
+        "  uv venv ~/.venvs/ephemdir-safe --python 3.12\n"
+        "  uv pip install --python ~/.venvs/ephemdir-safe/bin/python ephemdir\n"
+        "  ~/.venvs/ephemdir-safe/bin/python -I -m ephemdir install-service"
+    )
+
+
 def _check_runtime_component(current: Path, info: os.stat_result, description: str) -> None:
     """Reject one runtime path component another local user could replace.
 
@@ -285,9 +300,9 @@ def _check_runtime_component(current: Path, info: os.stat_result, description: s
     if _writable_by_other_users(info.st_mode):
         raise ServiceError(
             f"refusing to install service: {description} {current} is "
-            "writable by other users (shared directories like /tmp cannot "
-            "host a scheduled service runtime, sticky bit or not; install "
-            "the interpreter/venv under your home directory instead)"
+            "group/world-writable (writable by other users); shared directories "
+            "like /tmp cannot host a scheduled service runtime, sticky bit or not."
+            f"{_safe_uv_runtime_hint()}"
         )
     if hasattr(os, "geteuid") and info.st_uid not in (0, os.geteuid()):
         raise ServiceError(
@@ -369,7 +384,9 @@ def _validate_runtime_dir(path: Path, label: str) -> None:
         raise ServiceError(f"refusing to install service: {label} is not a directory")
     if _writable_by_other_users(final_info.st_mode):
         raise ServiceError(
-            f"refusing to install service: {label} {absolute} is writable by other users"
+            f"refusing to install service: {label} {absolute} is "
+            "group/world-writable (writable by other users)."
+            f"{_safe_uv_runtime_hint()}"
         )
     if hasattr(os, "geteuid") and final_info.st_uid not in (0, os.geteuid()):
         raise ServiceError(f"refusing to install service: {label} is owned by another user")
@@ -535,7 +552,7 @@ def _reject_elevated_user_install() -> None:
 def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
     """Run a scheduler command with a timeout; timeouts become ServiceError."""
     try:
-        return subprocess.run(
+        return subprocess.run(  # nosec B603
             command,
             capture_output=True,
             text=True,
@@ -587,7 +604,8 @@ def _verify_isolated_import() -> None:
         "print(os.path.dirname(os.path.abspath(ephemdir.__file__)))"
     )
     try:
-        probe = subprocess.run(
+        # Probe the current interpreter in isolated mode, with no shell involved.
+        probe = subprocess.run(  # nosec B603
             [sys.executable, "-I", "-c", probe_code],
             capture_output=True,
             text=True,

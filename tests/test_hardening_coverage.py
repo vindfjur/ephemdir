@@ -65,6 +65,22 @@ def test_platform_directory_selection_without_creation(tmp_path, monkeypatch):
     assert all(create is False for _, create in captured)
 
 
+def test_platform_canonicalizes_only_macos_var_alias(monkeypatch):
+    monkeypatch.setattr(_platform.sys, "platform", "darwin")
+
+    assert _platform._canonical_private_dir_path(Path("/var/folders/x/data")) == Path(
+        "/private/var/folders/x/data"
+    )
+    assert _platform._canonical_private_dir_path(Path("/tmp/link/data")) == Path(
+        "/tmp/link/data"
+    )
+
+    monkeypatch.setattr(_platform.sys, "platform", "linux")
+    assert _platform._canonical_private_dir_path(Path("/var/folders/x/data")) == Path(
+        "/var/folders/x/data"
+    )
+
+
 def test_platform_boot_identity_and_time_probes(monkeypatch):
     monkeypatch.setattr(_platform.sys, "platform", "linux")
     monkeypatch.setattr(
@@ -333,6 +349,30 @@ def test_doctor_run_uses_boot_time_fallback(tmp_path, monkeypatch):
     checks = _doctor.run_doctor(registry=registry)
 
     assert next(check for check in checks if check.name == "boot-id").ok is True
+
+
+def test_doctor_env_source_diagnostics(monkeypatch, tmp_path):
+    monkeypatch.delenv("EPHEMDIR_DATA_DIR", raising=False)
+    monkeypatch.delenv("EPHEMDIR_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(_doctor.sys, "platform", "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
+
+    assert _doctor._env_value("XDG_DATA_HOME") == f"XDG_DATA_HOME={tmp_path / 'xdg-data'}"
+    assert _doctor._data_dir_source() == f"XDG_DATA_HOME={tmp_path / 'xdg-data'}"
+    assert _doctor._config_dir_source() == f"XDG_CONFIG_HOME={tmp_path / 'xdg-config'}"
+
+    monkeypatch.delenv("XDG_DATA_HOME")
+    monkeypatch.delenv("XDG_CONFIG_HOME")
+    assert _doctor._env_value("XDG_DATA_HOME") == "XDG_DATA_HOME=unset"
+    assert _doctor._data_dir_source() == "platform default"
+    assert _doctor._config_dir_source() == "platform default"
+
+    monkeypatch.setattr(_doctor.sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    monkeypatch.setenv("APPDATA", str(tmp_path / "roaming"))
+    assert _doctor._data_dir_source() == f"platform env={tmp_path / 'local'}"
+    assert _doctor._config_dir_source() == f"platform env={tmp_path / 'roaming'}"
 
 
 def test_size_parser_and_budget_edges(tmp_path, monkeypatch):

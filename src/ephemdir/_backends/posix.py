@@ -1,7 +1,7 @@
 """POSIX backend descriptor.
 
 The safety-critical implementation still lives in :mod:`ephemdir.core` for
-v0.5.0 compatibility; this backend exposes platform capabilities and delegates
+v0.5.x compatibility; this backend exposes platform capabilities and delegates
 read-only measurement.
 """
 

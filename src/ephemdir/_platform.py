@@ -26,9 +26,27 @@ _BOOT_TOLERANCE_SECONDS = 120.0
 
 def _user_private_dir(path: Path, *, create: bool) -> Path:
     """Return an absolute private app directory, creating it safely if asked."""
-    absolute = Path(os.path.abspath(path))
+    absolute = _canonical_private_dir_path(path)
     if create:
         ensure_private_directory(absolute)
+    return absolute
+
+
+def _canonical_private_dir_path(path: Path) -> Path:
+    """Return a stable absolute app-state path without following user symlinks.
+
+    macOS exposes ``/var`` as a root-owned system symlink to ``/private/var``.
+    Shell helpers such as ``mktemp`` commonly return paths under ``/var``, but
+    ephemdir's state-directory trust walk intentionally rejects symlink
+    components.  Normalize that one platform alias lexically; do not call
+    ``realpath`` on the whole path, because that would also resolve arbitrary
+    user-controlled symlinks inside shared temporary directories.
+    """
+    absolute = Path(os.path.abspath(path))
+    if sys.platform == "darwin":
+        parts = absolute.parts
+        if len(parts) >= 2 and parts[0] == "/" and parts[1] == "var":
+            return Path("/private", *parts[1:])
     return absolute
 
 
@@ -171,13 +189,14 @@ def _boot_time_linux() -> float | None:
 
 def _boot_time_macos() -> float | None:
     """Read the exact boot time from ``sysctl kern.boottime`` on macOS/BSD."""
-    import subprocess
+    # sysctl is resolved from trusted system directories and run without a shell.
+    import subprocess  # nosec B404
 
     executable = resolve_system_executable("sysctl")
     if executable is None:
         return None
     try:
-        output = subprocess.check_output(
+        output = subprocess.check_output(  # nosec B603
             [executable, "-n", "kern.boottime"],
             stderr=subprocess.DEVNULL,
             text=True,

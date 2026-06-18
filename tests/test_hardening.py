@@ -107,7 +107,7 @@ def test_write_marker_rejects_noncanonical_explicit_id(tmp_path):
 
 def test_replaced_directory_is_never_deleted(tmp_path, registry):
     # A directory deleted manually can be replaced at the same path before the
-    # sweep runs; the replacement must never be removed.
+    # sweep runs; the replacement must never be removed or silently untracked.
     d = tempdir(lifetime="1h", parent=tmp_path, registry=registry)
     shutil.rmtree(d.path)
     impostor = d.path
@@ -117,7 +117,7 @@ def test_replaced_directory_is_never_deleted(tmp_path, registry):
 
     assert sweep(registry=registry) == 0
     assert (impostor / "precious.txt").read_text() == "user data"
-    assert str(d.path) not in registered(registry=registry)  # stale entry dropped
+    assert str(d.path) in registered(registry=registry)
 
 
 def test_tampered_marker_blocks_deletion(tmp_path, registry):
@@ -633,14 +633,47 @@ def test_resolve_stale_snapshot_does_not_delete_new_entry(tmp_path, registry, mo
         return real_path_state(probed)
 
     monkeypatch.setattr(core, "_path_state", racing_path_state)
-    with pytest.raises(LookupError, match="changed while resolving"):
+    with pytest.raises(LookupError, match="currently missing"):
         core.resolve(path.name, registry=registry)
 
     assert registered(registry=registry)[str(path)] == new_entry
     assert path.is_dir()
 
 
-def test_keep_extend_remove_refuse_changed_entry_after_resolve(tmp_path, registry, monkeypatch):
+def test_keep_refuses_changed_entry_after_probe(tmp_path, registry, monkeypatch):
+    path = tmp_path / "same-name"
+    path.mkdir()
+    old_entry = {
+        "created_at": 1.0,
+        "expires_at": None,
+        "remove_on_restart": False,
+        "keep_while_in_use": False,
+        "marker_id": "c" * 32,
+        "state": "active",
+        "claim_id": None,
+        "staging_path": None,
+    }
+    new_entry = {**old_entry, "marker_id": "d" * 32, "created_at": 2.0}
+    with registry.transaction() as state:
+        state[str(path)] = dict(old_entry)
+
+    real_path_state = core._path_state
+
+    def racing_path_state(probed):
+        if probed == path:
+            with registry.transaction() as state:
+                state[str(path)] = dict(new_entry)
+            return "present"
+        return real_path_state(probed)
+
+    monkeypatch.setattr(core, "_path_state", racing_path_state)
+
+    with pytest.raises(LookupError):
+        keep(path.name, registry=registry)
+    assert registered(registry=registry)[str(path)] == new_entry
+
+
+def test_extend_remove_refuse_changed_entry_after_resolve(tmp_path, registry, monkeypatch):
     path = tmp_path / "same-name"
     path.mkdir()
     old_entry = {
@@ -663,8 +696,6 @@ def test_keep_extend_remove_refuse_changed_entry_after_resolve(tmp_path, registr
         lambda target, *, registry: (path, dict(old_entry)),
     )
 
-    with pytest.raises(LookupError):
-        keep(path.name, registry=registry)
     with pytest.raises(LookupError):
         extend(path.name, "2h", registry=registry)
     with pytest.raises(OSError, match="changed concurrently"):
@@ -1005,14 +1036,15 @@ def test_recovery_accepts_legacy_tree_returned_to_original(tmp_path, registry):
     assert d.path.is_dir()
 
 
-def test_recovery_drops_entry_when_nothing_left_on_disk(tmp_path, registry):
+def test_recovery_preserves_entry_when_nothing_left_on_disk(tmp_path, registry):
     d = tempdir(parent=tmp_path, registry=registry)
     staging = d.path.parent / f".{d.path.name}.123-abcdef12.deleting"
     _journal_intent(registry, d.path, staging)
     shutil.rmtree(d.path)  # both original and staging are gone
 
     sweep(registry=registry)
-    assert registered(registry=registry) == {}
+    entry = registered(registry=registry)[str(d.path)]
+    assert entry["state"] == "recovery"
 
 
 # --- Per-directory deletion lock ------------------------------------------------

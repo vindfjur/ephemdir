@@ -10,12 +10,14 @@ errs on the side of keeping the data and defers the deletion.
 from __future__ import annotations
 
 import os
-import subprocess
+import subprocess  # nosec B404
 import sys
 
 from ._trusted_exec import minimal_subprocess_env, resolve_system_executable, stable_subprocess_cwd
 
 __all__ = ["is_in_use"]
+
+# External probes use fixed argv, trusted executable resolution and no shell.
 
 # Upper bound for the external probe so a slow ``lsof`` never stalls a sweep.
 _PROBE_TIMEOUT_SECONDS = 10.0
@@ -47,7 +49,8 @@ def _lsof_in_use(path: str) -> bool | None:
     if executable is None:
         return None
     try:
-        result = subprocess.run(
+        # lsof is resolved from trusted system directories.
+        result = subprocess.run(  # nosec B603
             [executable, "+D", path],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,

@@ -35,7 +35,14 @@ from ._mounts import (
     linux_mount_id_statx as _shared_linux_mount_id_statx,
 )
 from ._naming import clean_name, funny_name
-from ._platform import boot_session_id, boot_time, same_boot, user_config_dir, user_data_dir
+from ._platform import (
+    _canonical_private_dir_path,
+    boot_session_id,
+    boot_time,
+    same_boot,
+    user_config_dir,
+    user_data_dir,
+)
 from ._policy import CleanupDecision, CleanupPolicy, SweepMode, decide_cleanup
 from ._registry import Entry, Registry
 from ._security import (
@@ -440,7 +447,9 @@ def _path_state(path: Path) -> str:
 
     ``Path.exists()`` conflates "really gone" with "temporarily unreachable"
     (permission error, detached network mount, transient I/O failure); an
-    entry must only be dropped as stale when the path is provably missing.
+    entry must never be dropped by implicit cleanup just because the path is
+    provably missing. Missing active entries stay tracked until an explicit
+    user command such as ``prune`` or ``keep`` forgets them.
     """
     try:
         os.lstat(path)
@@ -1021,7 +1030,7 @@ def _normalize_parent_value(value: object) -> Path:
         return Path.cwd()
     if not isinstance(value, (str, os.PathLike)):
         raise TypeError("parent must be str, os.PathLike, or None")
-    return Path(os.path.abspath(Path(value).expanduser()))
+    return _canonical_private_dir_path(Path(value).expanduser())
 
 
 def _preflight_existing_parent(parent: Path) -> int | None:
@@ -1090,7 +1099,6 @@ def sweep(
     now = time.time()
     current_boot = boot_time()
     current_boot_id = boot_session_id()
-    stale = 0
     journal: list[tuple[Path, Entry]] = []
     candidates: list[tuple[Path, Entry]] = []
 
@@ -1112,8 +1120,11 @@ def sweep(
 
             probe = _path_state(path)
             if probe == "missing":
-                del state[key]
-                stale += 1
+                logger.warning(
+                    "%s is missing; keeping its entry until deletion is verified "
+                    "or it is explicitly pruned/kept",
+                    path,
+                )
                 continue
             if probe == "unknown":
                 logger.warning("cannot probe %s; keeping its entry untouched", path)
@@ -1137,10 +1148,9 @@ def sweep(
             if ownership == "foreign":
                 logger.warning(
                     "%s is no longer the directory ephemdir created; leaving it "
-                    "alone and dropping the entry",
+                    "alone and keeping the entry blocked until explicit keep",
                     path,
                 )
-                del state[key]
                 continue
             if ownership == "unverified":
                 logger.warning(
@@ -1234,12 +1244,6 @@ def sweep(
                     path,
                 )
 
-    if stale:
-        logger.info(
-            "dropped %d stale entr%s (directories deleted outside ephemdir)",
-            stale,
-            "y" if stale == 1 else "ies",
-        )
     return removed
 
 
@@ -1412,17 +1416,10 @@ def _resolve_active(
         )
     probe = _path_state(path)
     if probe == "missing":
-        with reg.transaction() as live:
-            current = live.get(str(path))
-            if current == snapshot and _path_state(path) == "missing":
-                del live[str(path)]
-            elif current is not None:
-                raise LookupError(
-                    f"{path} changed while resolving; retry the command"
-                ) from None
         raise LookupError(
-            f"{path} was tracked but no longer exists "
-            "(deleted outside ephemdir); the stale entry has been removed"
+            f"{path} is tracked but currently missing; the entry was preserved. "
+            "Run `ephemdir prune` to forget missing entries or "
+            f"`ephemdir keep {path.name}` to forget this one."
         )
     if probe == "unknown":
         raise LookupError(
@@ -1434,8 +1431,9 @@ def _resolve_active(
 def resolve(target: str | os.PathLike[str], *, registry: Registry | None = None) -> Path:
     """Resolve ``target`` to an active tracked directory.
 
-    A temporarily inaccessible path is preserved in the registry and reported
-    as unavailable; only a definite ``ENOENT`` removes the stale entry.
+    Missing or temporarily inaccessible paths are preserved in the registry and
+    reported as unavailable; only explicit commands such as ``prune`` or
+    ``keep`` forget missing active entries.
     """
     reg = registry or Registry()
     path, _ = _resolve_active(target, registry=reg)
@@ -1449,7 +1447,23 @@ def keep(target: str | os.PathLike[str], *, registry: Registry | None = None) ->
     never be auto-removed. ``target`` accepts anything :func:`resolve` does.
     """
     reg = registry or Registry()
-    path, snapshot = _resolve_active(target, registry=reg)
+    state = {
+        key: entry
+        for key, entry in reg.load(read_only=True).items()
+        if entry.get("state", "active") == "active"
+    }
+    path = _match_target(target, state)
+    snapshot = dict(state[str(path)])
+    blockers = _entry_compatibility_blockers(snapshot)
+    if blockers:
+        raise LookupError(
+            f"{path} is tracked for an incompatible runtime: {', '.join(blockers)}"
+        )
+    probe = _path_state(path)
+    if probe == "unknown":
+        raise LookupError(
+            f"{path} is temporarily inaccessible; its registry entry was preserved"
+        )
     with reg.transaction() as state:
         entry = state.get(str(path))
         if entry != snapshot:
@@ -1458,11 +1472,16 @@ def keep(target: str | os.PathLike[str], *, registry: Registry | None = None) ->
             raise LookupError(
                 f"{path} is no longer tracked (a concurrent sweep claimed it first)"
             )
+        if probe == "missing" and _path_state(path) != "missing":
+            raise LookupError(f"{path} reappeared while keeping; retry the command")
         del state[str(path)]
-    # Only delete the marker when it is verifiably ours: a replaced directory
-    # may contain the user's own .ephemdir file, a legacy one never had any.
-    _remove_marker_if_ours(path, entry.get("marker_id"))
-    logger.info("kept %s (no longer tracked)", path)
+    if probe == "present":
+        # Only delete the marker when it is verifiably ours: a replaced directory
+        # may contain the user's own .ephemdir file, a legacy one never had any.
+        _remove_marker_if_ours(path, entry.get("marker_id"))
+        logger.info("kept %s (no longer tracked)", path)
+    else:
+        logger.info("forgot missing tracked directory: %s", path)
     return path
 
 
@@ -1572,10 +1591,10 @@ def recover(
 
 
 def prune(*, registry: Registry | None = None) -> int:
-    """Drop registry entries whose directories were deleted outside ephemdir.
+    """Drop missing active entries by explicit user request.
 
-    Returns the number of stale entries removed. Sweeps do this automatically;
-    ``prune`` only tidies the registry without deleting anything from disk.
+    Returns the number of entries forgotten. ``prune`` only tidies the registry
+    and never deletes anything from disk; sweeps preserve missing entries.
     """
     reg = registry or Registry()
     pruned = 0
@@ -1591,8 +1610,9 @@ def prune(*, registry: Registry | None = None) -> int:
             if _path_state(Path(key)) == "missing":
                 del state[key]
                 pruned += 1
+                logger.warning("forgot missing tracked directory: %s", key)
     if pruned:
-        logger.info("pruned %d stale entr%s", pruned, "y" if pruned == 1 else "ies")
+        logger.info("pruned %d missing entr%s", pruned, "y" if pruned == 1 else "ies")
     return pruned
 
 
@@ -1605,7 +1625,7 @@ def dir_status(
 ) -> str:
     """Classify a registry entry for display purposes.
 
-    Returns one of ``"missing"`` (deleted outside ephemdir), ``"deleting"``
+    Returns one of ``"missing"`` (path absent but still tracked), ``"deleting"``
     (mid-deletion, finished or retried by sweeps), ``"recovery"`` (an
     interrupted deletion that needs manual attention), ``"replaced"``
     (something else now occupies the path), ``"legacy"`` (created by
@@ -1692,12 +1712,28 @@ def _decision_for_entry(
             measured = result.bytes
             complete = result.complete
     elif path_probe == "missing":
+        present_policy = decide_cleanup(
+            path,
+            entry,
+            now=now,
+            current_boot=current_boot,
+            current_boot_id=current_boot_id,
+            mode=mode,
+            path_state="present",
+            ownership="ours",
+            parent_error=None,
+            in_use=False,
+            measured_size_bytes=None,
+            size_complete=True,
+            same_boot_func=same_boot,
+        )
+        blockers = tuple(dict.fromkeys(("path-missing",) + present_policy.blockers))
         return CleanupDecision(
             path=path,
-            due=False,
-            status="stale",
-            reasons=(),
-            blockers=(),
+            due=present_policy.due,
+            status="missing",
+            reasons=present_policy.reasons,
+            blockers=blockers,
             destructive_allowed=False,
             measured_size_bytes=None,
             max_size_bytes=(
@@ -2271,7 +2307,6 @@ def _try_claim(
             if ownership == "unverified" and not allow_unverified:
                 return "unverified", None, None
             if ownership == "foreign":
-                del state[key]
                 return "foreign", None, None
 
             backend_error = _safe_delete_backend_error()
@@ -2288,8 +2323,6 @@ def _try_claim(
                 path, parent_fd, entry, allow_unverified=allow_unverified
             )
             if preflight != "ready":
-                if preflight == "foreign":
-                    del state[key]
                 return preflight, None, None
             if opened_fd is None or source_stat is None:
                 return "unsupported", None, None
@@ -2439,8 +2472,9 @@ def _recover_entry(
 
     Returns ``("resume", staging, claimed_entry)`` when a verified staging
     tree should be deleted now, or a non-destructive status otherwise.  The
-    function may also repair an entry back to ``active`` or drop it when both
-    paths are provably gone.
+    function may also repair an entry back to ``active``. Missing or ambiguous
+    journal paths stay in recovery until the user explicitly retries or
+    forgets them.
     """
     original = Path(key)
     with registry.transaction() as state:
@@ -2476,8 +2510,8 @@ def _recover_entry(
         staging_here = staging_probe == "present"
 
         if not original_here and not staging_here:
-            del state[key]
-            return "dropped", None, None
+            entry.update({"state": "recovery", "claim_id": None})
+            return "recovery", None, dict(entry)
 
         original_verdict = _ownership(original, entry) if original_here else "missing"
         staging_verdict = (
@@ -2520,8 +2554,8 @@ def _recover_entry(
             return "recovery", None, dict(entry)
 
         if original_here and original_verdict == "foreign" and not staging_here:
-            del state[key]
-            return "foreign", None, None
+            entry.update({"state": "recovery", "claim_id": None})
+            return "recovery", None, dict(entry)
 
         entry.update({"state": "recovery", "claim_id": None})
         return "recovery", None, dict(entry)
