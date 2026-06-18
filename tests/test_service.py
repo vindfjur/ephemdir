@@ -539,7 +539,7 @@ def test_runtime_path_rejects_other_user_writable_component(tmp_path):
     runtime.write_text("placeholder", encoding="utf-8")
     runtime.chmod(0o666)
 
-    with pytest.raises(_service.ServiceError, match="writable by other users"):
+    with pytest.raises(_service.ServiceError, match="group/world-writable"):
         _service._validate_runtime_path(runtime, "test runtime")
 
 
@@ -548,12 +548,33 @@ def test_runtime_component_rejects_sticky_shared_temp_dir():
         (stat.S_IFDIR | 0o1777, 1, 2, 1, 0, 0, 0, 0, 0, 0)
     )
 
-    with pytest.raises(_service.ServiceError, match="shared directories like /tmp"):
+    with pytest.raises(_service.ServiceError, match="group/world-writable"):
         _service._check_runtime_component(
             Path("/tmp"),
             sticky_tmp,
             "test runtime path component",
         )
+
+
+def test_runtime_error_recommends_safe_uv_managed_venv():
+    uid = os.geteuid() if hasattr(os, "geteuid") else 0
+    writable = os.stat_result(
+        (stat.S_IFDIR | 0o777, 1, 2, 1, uid, 0, 0, 0, 0, 0)
+    )
+
+    with pytest.raises(_service.ServiceError) as exc_info:
+        _service._check_runtime_component(
+            Path("/tmp"),
+            writable,
+            "test runtime path component",
+        )
+
+    message = str(exc_info.value)
+    assert "group/world-writable" in message
+    assert "uv python install 3.12" in message
+    assert "uv venv ~/.venvs/ephemdir-safe --python 3.12" in message
+    assert "uv pip install --python ~/.venvs/ephemdir-safe/bin/python ephemdir" in message
+    assert "~/.venvs/ephemdir-safe/bin/python -I -m ephemdir install-service" in message
 
 
 def _synthetic_lstat(real_lstat, foreign=()):

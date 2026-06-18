@@ -94,8 +94,8 @@ def test_list_marks_manually_deleted(capsys, tmp_path):
     shutil.rmtree(created)
     assert main(["list", "--plain"]) == 0
     out = capsys.readouterr().out
-    assert "[gone]" in out
-    assert "deleted manually" in out
+    assert "[miss]" in out
+    assert "still tracked" in out
 
 
 def test_list_marks_replaced_directory(capsys, tmp_path):
@@ -207,6 +207,7 @@ def test_prune_forgets_deleted_directories(capsys, tmp_path):
     created = _create(capsys, tmp_path)
     shutil.rmtree(created)
     assert main(["prune"]) == 0
+    assert f"forgot missing tracked directory: {created}" in capsys.readouterr().err
     assert main(["list", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == []
 
@@ -234,6 +235,41 @@ def test_sweep_removes_expired_directory(capsys, tmp_path):
 def test_dry_run_does_not_create_data_dir(capsys):
     data_dir = Path(os.environ["EPHEMDIR_DATA_DIR"])
     assert not data_dir.exists()
+
+
+def test_read_only_commands_do_not_mutate_registry_or_quarantine(capsys, tmp_path):
+    created = Path(_create(capsys, tmp_path, "--until-sweep"))
+    registry = Registry()
+    before = registry.path.read_bytes()
+
+    for command in (
+        ["list"],
+        ["list", "--json"],
+        ["explain", created.name],
+        ["sweep", "--dry-run"],
+        ["doctor"],
+        ["completion", "show", "zsh"],
+    ):
+        assert main(command) in {0, 1}
+        capsys.readouterr()
+        assert registry.path.read_bytes() == before
+        assert list(registry.path.parent.glob("registry.json.corrupt-*")) == []
+
+
+def test_read_only_commands_do_not_create_empty_registry_or_state_files(capsys):
+    data_dir = Path(os.environ["EPHEMDIR_DATA_DIR"])
+    assert not data_dir.exists()
+
+    for command in (
+        ["list"],
+        ["list", "--json"],
+        ["sweep", "--dry-run"],
+        ["doctor"],
+        ["completion", "show", "zsh"],
+    ):
+        assert main(command) in {0, 1}
+        capsys.readouterr()
+        assert not data_dir.exists()
 
     assert main(["sweep", "--dry-run"]) == 0
 
@@ -301,6 +337,8 @@ def test_doctor_json(capsys):
     assert main(["doctor", "--json"]) in {0, 1}
     payload = json.loads(capsys.readouterr().out)
     assert any(item["name"] == "registry" for item in payload)
+    assert any(item["name"] == "registry-path" for item in payload)
+    assert any(item["name"] == "service-env" for item in payload)
 
 
 def test_doctor_text_includes_hints(capsys, monkeypatch):
@@ -469,6 +507,18 @@ def test_main_reports_registry_errors_without_traceback(capsys, monkeypatch, err
     assert "Traceback" not in result.err
 
 
+def test_main_reports_permission_errors_without_traceback(capsys, monkeypatch):
+    monkeypatch.setattr(
+        "ephemdir.cli.registered",
+        lambda: (_ for _ in ()).throw(PermissionError("/var is a symlink")),
+    )
+
+    assert main(["list"]) == 1
+    result = capsys.readouterr()
+    assert "/var is a symlink" in result.err
+    assert "Traceback" not in result.err
+
+
 @pytest.mark.parametrize(
     "seconds, expected",
     [
@@ -499,6 +549,7 @@ def test_format_timestamp_status_notes_and_emoji_support(monkeypatch):
 
     now = 100.0
     assert _status_note("legacy", {}, now).startswith("from an older")
+    assert _status_note("missing", {}, now) == "missing; still tracked"
     assert _status_note("deleting", {}, now).startswith("partially")
     assert _status_note("recovery", {}, now).startswith("interrupted")
     assert _status_note("unavailable", {}, now).startswith("temporarily")

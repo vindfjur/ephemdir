@@ -28,7 +28,10 @@ POSIX deletion is fd-relative and refuses symlink, parent-trust and mount-bounda
 violations. When a platform cannot provide the required safe primitive,
 `tempdir()` fails before creation and cleanup fails closed before claim: the
 original pathname and active entry stay untouched rather than being moved or
-deleted by pathname. Registry reads and writes are bounded to 1 MiB, use a v2
+deleted by pathname. A missing active path is not treated as proof that cleanup
+succeeded: the entry remains tracked and blocked until ephemdir verifies a
+deletion, or until the user explicitly forgets it with `prune`, `keep` or
+`recover --forget` for recovery entries. Registry reads and writes are bounded to 1 MiB, use a v2
 envelope on write, and use non-blocking no-follow opens, preventing FIFOs and
 other special files from stalling commands or the scheduled sweeper. A registry
 that is group/world-*writable* is treated as potentially tampered: it is refused
@@ -63,3 +66,9 @@ guarantees. On a single-user system this requires no action; on a shared host,
 confirm the environment's ownership and permissions before scheduling sweeps.
 One-off interactive `tempdir()`, `ephemdir sweep` and the rest of the CLI do not
 rely on this and are unaffected.
+
+On macOS, a Homebrew or shared Python runtime can be rejected for scheduled
+service use when any runtime component is group/world-writable. That rejection
+is intentional; launchd runs the interpreter later, after the current shell is
+gone. A safe pattern is to install the service from a private uv-managed venv
+under the user's home directory.

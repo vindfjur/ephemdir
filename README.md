@@ -17,15 +17,14 @@ anything on unsupported platforms. The package has no third-party runtime
 dependencies on Python 3.11+; Python 3.10 uses `tomli` only for TOML
 configuration parsing.
 
-v0.5.0 is a POSIX-only hardening release. It adds next-sweep cleanup,
-max-size cleanup thresholds, clean/secure naming policy, dry-run sweep
-previews, stricter registry validation, improved scheduler safety and better
-CLI diagnostics. Windows remains unsupported.
+v0.5.1 is a POSIX-only hotfix release. It keeps the v0.5 hardening work and
+adds stricter restart/recovery tracking: missing paths are reported and kept
+tracked until ephemdir verifies deletion or you explicitly forget them.
 
 ## Installation
 
 > [!IMPORTANT]
-> Windows is **not supported in ephemdir 0.5.0**. The package may install on
+> Windows is **not supported in ephemdir 0.5.1**. The package may install on
 > Windows, but `tempdir()` and `ephemdir new` fail before creating anything
 > because Python does not expose the safe handle-bound recursive deletion
 > primitives ephemdir requires. Supported platforms are Linux and macOS.
@@ -71,7 +70,7 @@ python -m pip install ephemdir
 ```python
 from ephemdir import tempdir
 
-# Lives until the next system restart (the default).
+# Due after the next system restart (the default).
 work = tempdir()
 print(work)                       # -> /current/dir/brave-otter-a81f42c9d047315b
 (work.path / "data.txt").write_text("hello")
@@ -94,7 +93,7 @@ with tempdir() as scratch:
 
 | Parameter           | Default       | Description                                                       |
 | ------------------- | ------------- | ----------------------------------------------------------------- |
-| `lifetime`          | `None`        | Time to live: seconds, `timedelta`, or `"2h"`/`"1h30m"`. `None` = until restart. |
+| `lifetime`          | `None`        | Time to live: seconds, `timedelta`, or `"2h"`/`"1h30m"`. `None` = due after restart. |
 | `remove_on_restart` | `True`        | Remove the directory after the machine reboots.                   |
 | `keep_while_in_use` | `False`       | Defer deletion while files are still open inside (Linux/macOS).   |
 | `cleanup`           | `"auto"`      | Use `"next-sweep"` to keep until an explicit full sweep.          |
@@ -129,7 +128,7 @@ keep("brave-otter")          # liked it? make it permanent
 extend("brave-otter", "2h")  # give it two more hours from now
 remove("brave-otter")        # delete it right away
 resolve("bra")               # -> Path to the matching tracked directory
-prune()                      # forget entries whose dirs were deleted manually
+prune()                      # explicitly forget missing tracked entries
 ```
 
 ## How cleanup works
@@ -139,6 +138,11 @@ directory. Cleanup happens in two ways:
 
 1. **Lazily** — every call to `tempdir()` first sweeps anything already due.
 2. **On demand** — run `ephemdir sweep` from the command line.
+
+“Until restart” means a directory becomes due after the machine reboots; it is
+removed by the next sweep that can verify it is still the directory ephemdir
+created. Install the scheduled service if you want that sweep to happen
+automatically after login/reboot rather than only when you run ephemdir.
 
 Use `ephemdir sweep --dry-run` to preview due directories without destructive
 actions, and `ephemdir explain <name>` to see the reasons and blockers for one
@@ -152,7 +156,11 @@ ephemdir never auto-deletes a directory it cannot prove it created:
   id that is also stored in the registry (plus the inode on Unix). Nothing is
   auto-deleted unless the marker matches — if you delete a directory manually
   and something else later appears at the same path, ephemdir leaves it alone
-  (shown as ⚠️ `replaced` in `ephemdir list`). Directories registered by
+  and keeps the entry blocked (shown as ⚠️ `replaced` in `ephemdir list`).
+  If the path is missing, ephemdir reports 👻 `missing` and keeps tracking it
+  until verified deletion succeeds or you explicitly run `ephemdir prune`,
+  `ephemdir keep <name>` or `ephemdir recover <name> --forget` for recovery
+  entries. Directories registered by
   ephemdir ≤ 0.3 have no marker, so they are never auto-removed either: they
   show as ⚪ `legacy` until you `ephemdir rm` or `ephemdir keep` them.
 * Deletion is **journaled and claimed under locks**: the registry records the
@@ -232,6 +240,19 @@ under your home directory instead. It also checks the interpreter-startup
 hooks Python runs before ephemdir is imported (`.pth` files in site-packages,
 `sitecustomize`, `pyvenv.cfg`, and the `tomli` package on Python 3.10).
 
+On macOS, `install-service` may reject a Homebrew or otherwise shared Python
+runtime if any interpreter/package component is group/world-writable. That is
+expected: launchd will run the interpreter later, so ephemdir refuses a runtime
+another local user could modify after installation. For a dedicated service
+runtime, use a private uv-managed virtual environment under your home directory:
+
+```bash
+uv python install 3.12
+uv venv ~/.venvs/ephemdir-safe --python 3.12
+uv pip install --python ~/.venvs/ephemdir-safe/bin/python ephemdir
+~/.venvs/ephemdir-safe/bin/python -I -m ephemdir install-service
+```
+
 > **Trust boundary for `install-service`.** The scheduled job runs your Python
 > interpreter unattended and later, as your user. ephemdir verifies its own
 > package, the interpreter, and the startup hooks above, but it cannot
@@ -290,7 +311,7 @@ ephemdir extend brave-otter 2h   # fresh lifetime from now (--forever: no limit)
 ephemdir rm brave-otter          # remove a tracked directory now
 ephemdir sweep                   # remove everything due now
 ephemdir sweep --force           # remove every tracked directory
-ephemdir prune                   # forget entries deleted outside ephemdir
+ephemdir prune                   # explicitly forget missing tracked entries
 ephemdir recover brave-otter     # retry an interrupted deletion
 ephemdir recover brave-otter --forget  # forget it without deleting files
 ephemdir watch                   # sweep periodically in the foreground
@@ -312,13 +333,13 @@ stay quiet.
 🟡 vermilion-mackerel  4m 59s left              ~/work/vermilion-mackerel
 🔄 caped-dodo          until restart            ~/work/caped-dodo
 🔴 furious-caiman      expired 5m ago           ~/work/furious-caiman
-👻 lucky-yak           gone (deleted manually)  ~/work/lucky-yak
+👻 lucky-yak           missing; still tracked   ~/work/lucky-yak
 ```
 
 `🟢` counting down · `🟡` less than 15 minutes left · `🔴` due on the next
-sweep · `🔄` until restart · `📌` no auto-cleanup · `👻` deleted outside
-ephemdir (the entry is dropped automatically) · `⚠️` replaced by another
-directory (never touched) · `⚪` legacy entry from ephemdir ≤ 0.3 (resolve
+sweep · `🔄` until restart · `📌` no auto-cleanup · `👻` missing from disk but
+still tracked until explicit prune/keep · `⚠️` replaced by another directory
+(never touched, still tracked) · `⚪` legacy entry from ephemdir ≤ 0.3 (resolve
 with `rm`/`keep`) · `🚧` interrupted deletion requiring `recover` · `❓`
 temporarily inaccessible but still tracked. Terminals without emoji support
 fall back to ASCII tags; `--plain` forces them, `--json` prints

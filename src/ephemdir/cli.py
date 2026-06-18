@@ -9,7 +9,7 @@ Exposes the library through a small ``ephemdir`` command:
 * ``ephemdir extend``     -- give a directory a fresh lifetime
 * ``ephemdir rm``         -- remove a tracked directory now
 * ``ephemdir sweep``      -- remove every directory that is due for cleanup
-* ``ephemdir prune``      -- forget entries whose directories were deleted manually
+* ``ephemdir prune``      -- forget missing tracked directories explicitly
 * ``ephemdir watch``      -- run a foreground loop that sweeps periodically
 * ``ephemdir shell-init`` -- print shell functions (``ecd``, ``enew``) to eval
 """
@@ -78,7 +78,7 @@ _ASCII_ICONS = {
     "until-restart": "[boot]",
     "until-sweep": "[swp] ",
     "kept": "[pin] ",
-    "missing": "[gone]",
+    "missing": "[miss]",
     "replaced": "[warn]",
     "legacy": "[old] ",
     "deleting": "[del] ",
@@ -186,7 +186,7 @@ def _format_duration(seconds: float) -> str:
 def _status_note(status: str, entry: Entry, now: float) -> str:
     """One short human phrase describing what happens to the directory next."""
     if status == "missing":
-        return "gone (deleted manually)"
+        return "missing; still tracked"
     if status == "replaced":
         return "replaced by another directory; will not be touched"
     if status == "legacy":
@@ -470,7 +470,7 @@ def _cmd_recover(args: argparse.Namespace) -> int:
 
 def _cmd_prune(args: argparse.Namespace) -> int:
     count = prune()
-    logger.warning("pruned %d stale entr%s", count, "y" if count == 1 else "ies")
+    logger.warning("pruned %d missing entr%s", count, "y" if count == 1 else "ies")
     return 0
 
 
@@ -636,7 +636,7 @@ def build_parser() -> argparse.ArgumentParser:
     menu.set_defaults(func=_cmd_menu)
 
     prune_cmd = sub.add_parser(
-        "prune", help="forget entries whose directories were deleted manually")
+        "prune", help="forget missing tracked directories explicitly")
     prune_cmd.set_defaults(func=_cmd_prune)
 
     recover_cmd = sub.add_parser(
@@ -687,6 +687,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except UnsafeRegistryError as error:
         # The registry is writable by other users and was left untouched: a
         # clear message, not a traceback, and definitely no destructive action.
+        logger.error("%s", error)
+        return 1
+    except PermissionError as error:
         logger.error("%s", error)
         return 1
     except (RegistryFormatError, RegistryUnavailableError) as error:

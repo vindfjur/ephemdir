@@ -385,13 +385,42 @@ def test_sweep_mode_force_removes_everything(tmp_path, registry):
     assert not d.path.exists()
 
 
-def test_sweep_drops_vanished_entries(tmp_path, registry):
+def test_sweep_preserves_vanished_entries(tmp_path, registry):
     import shutil
 
     d = tempdir(parent=tmp_path, registry=registry)
     # Remove the directory behind ephemdir's back.
     shutil.rmtree(d.path)
-    sweep(registry=registry)
+    assert sweep(registry=registry) == 0
+    assert str(d.path) in registered(registry=registry)
+
+
+def test_restart_due_missing_entry_is_removed_after_reappearing(
+    tmp_path,
+    registry,
+    monkeypatch,
+):
+    import shutil
+
+    monkeypatch.setattr("ephemdir.core.boot_session_id", lambda: "current-boot")
+    d = tempdir(parent=tmp_path, registry=registry)
+    marker_id = registered(registry=registry)[str(d.path)]["marker_id"]
+    with registry.transaction() as state:
+        state[str(d.path)]["boot_id"] = "older-boot"
+    shutil.rmtree(d.path)
+
+    assert sweep(registry=registry) == 0
+    assert str(d.path) in registered(registry=registry)
+
+    d.path.mkdir(mode=0o700)
+    core_module._write_marker(d.path, marker_id)
+    path_stat = d.path.stat()
+    with registry.transaction() as state:
+        state[str(d.path)]["dev"] = path_stat.st_dev
+        state[str(d.path)]["ino"] = path_stat.st_ino
+
+    assert sweep(registry=registry) == 1
+    assert not d.path.exists()
     assert str(d.path) not in registered(registry=registry)
 
 
@@ -621,14 +650,17 @@ def test_plan_sweep_does_not_tighten_registry_permissions(tmp_path, registry):
     assert d.path.is_dir()
 
 
-def test_plan_sweep_marks_missing_entry_as_stale(tmp_path, registry):
+def test_plan_sweep_marks_missing_entry_as_blocked(tmp_path, registry):
     d = tempdir(cleanup="next-sweep", parent=tmp_path, registry=registry)
     import shutil
 
     shutil.rmtree(d.path)
 
     decision = next(item for item in plan_sweep(registry=registry) if item.path == d.path)
-    assert decision.status == "stale"
+    assert decision.status == "missing"
+    assert decision.due is True
+    assert decision.reasons == ("next-sweep",)
+    assert "path-missing" in decision.blockers
     assert decision.destructive_allowed is False
 
 
@@ -751,6 +783,12 @@ def test_tempdir_rejects_symlink_ancestor_before_maintenance(tmp_path, registry)
     assert expired.path.exists()
     assert str(expired.path) in registered(registry=registry)
     assert not (target / "child").exists()
+
+
+def test_normalize_parent_accepts_macos_var_alias(monkeypatch):
+    monkeypatch.setattr(core_module.sys, "platform", "darwin")
+
+    assert core_module._normalize_parent_value("/var/folders/x") == Path("/private/var/folders/x")
 
 
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlink support required")

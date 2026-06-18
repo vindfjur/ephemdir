@@ -36,6 +36,8 @@ class DoctorCheck:
 
 def run_doctor(*, registry: Registry | None = None) -> list[DoctorCheck]:
     reg = registry or Registry()
+    data_dir = user_data_dir(create=False)
+    config_dir = user_config_dir(create=False)
     checks: list[DoctorCheck] = []
     checks.append(
         DoctorCheck(
@@ -45,8 +47,25 @@ def run_doctor(*, registry: Registry | None = None) -> list[DoctorCheck]:
             None if os.name == "posix" else "Use ephemdir only on supported local filesystems.",
         )
     )
-    checks.append(_directory_check("data-dir", user_data_dir(create=False)))
-    checks.append(_directory_check("config-dir", user_config_dir(create=False)))
+    checks.append(DoctorCheck("registry-path", True, str(reg.path)))
+    checks.append(DoctorCheck("data-dir-source", True, _data_dir_source()))
+    checks.append(DoctorCheck("config-dir-source", True, _config_dir_source()))
+    checks.append(DoctorCheck("xdg-data-home", True, _env_value("XDG_DATA_HOME")))
+    checks.append(DoctorCheck("xdg-config-home", True, _env_value("XDG_CONFIG_HOME")))
+    checks.append(
+        DoctorCheck(
+            "service-env",
+            True,
+            " ".join(
+                (
+                    f"EPHEMDIR_DATA_DIR={Path(os.path.abspath(data_dir))}",
+                    f"EPHEMDIR_CONFIG_DIR={Path(os.path.abspath(config_dir))}",
+                )
+            ),
+        )
+    )
+    checks.append(_directory_check("data-dir", data_dir))
+    checks.append(_directory_check("config-dir", config_dir))
     checks.append(_registry_check(reg))
     boot_id = boot_session_id()
     checks.append(
@@ -58,6 +77,41 @@ def run_doctor(*, registry: Registry | None = None) -> list[DoctorCheck]:
         )
     )
     return checks
+
+
+def _env_value(name: str) -> str:
+    value = os.environ.get(name)
+    return f"{name}={value}" if value else f"{name}=unset"
+
+
+def _data_dir_source() -> str:
+    override = os.environ.get("EPHEMDIR_DATA_DIR")
+    if override:
+        return f"EPHEMDIR_DATA_DIR={override}"
+    if sys.platform not in {"win32", "darwin"}:
+        xdg = os.environ.get("XDG_DATA_HOME")
+        if xdg:
+            return f"XDG_DATA_HOME={xdg}"
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        if base:
+            return f"platform env={base}"
+    return "platform default"
+
+
+def _config_dir_source() -> str:
+    override = os.environ.get("EPHEMDIR_CONFIG_DIR")
+    if override:
+        return f"EPHEMDIR_CONFIG_DIR={override}"
+    if sys.platform not in {"win32", "darwin"}:
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        if xdg:
+            return f"XDG_CONFIG_HOME={xdg}"
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
+        if base:
+            return f"platform env={base}"
+    return "platform default"
 
 
 def _directory_check(name: str, path: Path) -> DoctorCheck:
