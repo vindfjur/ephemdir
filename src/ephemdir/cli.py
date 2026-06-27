@@ -37,11 +37,14 @@ from ._registry import Entry, RegistryFormatError, RegistryUnavailableError, Uns
 from ._service import ServiceError, install_service, uninstall_service
 from .core import (
     _UNSET,
+    _current_target_path,
+    _CurrentTargetNotFound,
     _path_state,
     dir_status,
     explain,
     extend,
     keep,
+    parse_lifetime,
     plan_sweep,
     prune,
     recover,
@@ -293,7 +296,8 @@ def _cmd_sweep(args: argparse.Namespace) -> int:
 
 def _cmd_explain(args: argparse.Namespace) -> int:
     try:
-        decision = explain(args.target)
+        target = args.target if args.target is not None else _current_target_path()
+        decision = explain(target)
     except LookupError as error:
         logger.error("%s", error)
         return 1
@@ -389,10 +393,17 @@ def _cmd_list(args: argparse.Namespace) -> int:
 
 def _cmd_path(args: argparse.Namespace) -> int:
     try:
-        if args.target is None:
-            path = _latest_tracked()
-        else:
+        if args.target is not None:
             path = resolve(args.target)
+        else:
+            # Inside a tracked ephemdir directory, print its root. Outside one,
+            # preserve the old fallback to the most recently created directory.
+            # A present-but-invalid marker (_CurrentTargetMismatch) fails closed
+            # and is NOT silently replaced by the latest fallback.
+            try:
+                path = _current_target_path()
+            except _CurrentTargetNotFound:
+                path = _latest_tracked()
     except LookupError as error:
         logger.error("%s", error)
         return 1
@@ -416,7 +427,8 @@ def _latest_tracked() -> Path:
 
 def _cmd_keep(args: argparse.Namespace) -> int:
     try:
-        path = keep(args.target)
+        target = args.target if args.target is not None else _current_target_path()
+        path = keep(target)
     except LookupError as error:
         logger.error("%s", error)
         return 1
@@ -425,28 +437,60 @@ def _cmd_keep(args: argparse.Namespace) -> int:
     return 0
 
 
+def _looks_like_lifetime(text: str) -> bool:
+    """Whether ``text`` parses as a lifetime (used to disambiguate `extend`)."""
+    try:
+        parse_lifetime(text)
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
 def _cmd_extend(args: argparse.Namespace) -> int:
-    if args.lifetime is None and not args.forever:
+    # Grammar (target optional when inside a tracked ephemdir directory):
+    #   extend <target> <lifetime>      extend <target> --forever
+    #   extend <lifetime>               extend --forever
+    arg1, arg2, forever = args.arg1, args.arg2, args.forever
+    if arg2 is not None:
+        if forever:
+            logger.error("--forever cannot be combined with a lifetime")
+            return 2
+        target, lifetime_str = arg1, arg2
+    elif arg1 is not None:
+        if forever:
+            if _looks_like_lifetime(arg1):
+                # `extend --forever 2h` (a lone lifetime + --forever) is a
+                # combination error, not a directory named "2h".
+                logger.error("--forever cannot be combined with a lifetime")
+                return 2
+            target, lifetime_str = arg1, None            # extend <target> --forever
+        elif _looks_like_lifetime(arg1):
+            target, lifetime_str = None, arg1            # extend <lifetime> (current)
+        else:
+            logger.error("specify a lifetime (e.g. 2h) or --forever")
+            return 2
+    elif forever:
+        target, lifetime_str = None, None                # extend --forever (current)
+    else:
         logger.error("specify a lifetime (e.g. 2h) or --forever")
         return 2
-    if args.lifetime is not None and args.forever:
-        logger.error("--forever cannot be combined with a lifetime")
-        return 2
     try:
-        path = extend(args.target, None if args.forever else args.lifetime)
+        resolved = target if target is not None else _current_target_path()
+        path = extend(resolved, None if forever else lifetime_str)
     except (LookupError, ValueError) as error:
         logger.error("%s", error)
         return 1
-    if args.forever:
+    if forever:
         logger.warning("extended %s -- no time limit (restart policy still applies)", path)
     else:
-        logger.warning("extended %s by %s from now", path, args.lifetime)
+        logger.warning("extended %s by %s from now", path, lifetime_str)
     return 0
 
 
 def _cmd_rm(args: argparse.Namespace) -> int:
     try:
-        path = remove(args.target)
+        target = args.target if args.target is not None else _current_target_path()
+        path = remove(target)
     except (LookupError, OSError) as error:
         logger.error("%s", error)
         return 1
@@ -504,7 +548,9 @@ def _detect_shell() -> str:
 
 def _cmd_install_service(args: argparse.Namespace) -> int:
     try:
-        message = install_service(interval=args.interval)
+        message = install_service(
+            interval=args.interval, runtime_policy=args.runtime_policy
+        )
     except (ServiceError, ValueError) as error:
         logger.error("%s", error)
         return 1
@@ -572,25 +618,31 @@ def build_parser() -> argparse.ArgumentParser:
     path_cmd = sub.add_parser(
         "path", help="print the path of a tracked directory (by name, prefix or path)")
     path_cmd.add_argument("target", nargs="?", default=None,
-                          help="directory name, unique prefix or path "
-                               "(default: most recently created)")
+                          help="directory name, unique prefix or path (default: the "
+                               "current ephemdir directory, else the most recently created)")
     path_cmd.set_defaults(func=_cmd_path)
 
     keep_cmd = sub.add_parser(
         "keep", help="stop tracking a directory so it is never auto-removed")
-    keep_cmd.add_argument("target", help="directory name, unique prefix or path")
+    keep_cmd.add_argument("target", nargs="?", default=None,
+                          help="directory name, unique prefix or path "
+                               "(default: the current ephemdir directory)")
     keep_cmd.set_defaults(func=_cmd_keep)
 
     extend_cmd = sub.add_parser("extend", help="give a directory a fresh lifetime from now")
-    extend_cmd.add_argument("target", help="directory name, unique prefix or path")
-    extend_cmd.add_argument("lifetime", nargs="?", default=None,
-                            help='new time to live, e.g. "2h" or "1d"')
+    extend_cmd.add_argument("arg1", nargs="?", default=None,
+                            help="directory name/prefix/path, or a lifetime like "
+                                 '"2h" to extend the current ephemdir directory')
+    extend_cmd.add_argument("arg2", nargs="?", default=None,
+                            help='new time to live when a target is given, e.g. "2h" or "1d"')
     extend_cmd.add_argument("--forever", action="store_true",
                             help="remove the time limit (restart policy still applies)")
     extend_cmd.set_defaults(func=_cmd_extend)
 
     rm = sub.add_parser("rm", help="remove a tracked directory now")
-    rm.add_argument("target", help="directory name, unique prefix or path")
+    rm.add_argument("target", nargs="?", default=None,
+                    help="directory name, unique prefix or path "
+                         "(default: the current ephemdir directory)")
     rm.set_defaults(func=_cmd_rm)
 
     sweep_cmd = sub.add_parser("sweep", help="remove directories that are due for cleanup")
@@ -601,7 +653,9 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_cmd.set_defaults(func=_cmd_sweep)
 
     explain_cmd = sub.add_parser("explain", help="explain cleanup state for a directory")
-    explain_cmd.add_argument("target", help="directory name, unique prefix or path")
+    explain_cmd.add_argument("target", nargs="?", default=None,
+                             help="directory name, unique prefix or path "
+                                  "(default: the current ephemdir directory)")
     explain_cmd.set_defaults(func=_cmd_explain)
 
     doctor_cmd = sub.add_parser("doctor", help="diagnose ephemdir safety prerequisites")
@@ -665,6 +719,14 @@ def build_parser() -> argparse.ArgumentParser:
                              help="install a scheduled sweep service for this platform")
     install.add_argument("--interval", type=int, default=600,
                          help="seconds between sweeps (default: 600)")
+    install.add_argument(
+        "--runtime-policy",
+        choices=["strict", "balanced"],
+        default=None,
+        help="runtime-trust policy for the service interpreter/package "
+             "(default: balanced on macOS, strict elsewhere; "
+             "env EPHEMDIR_SERVICE_RUNTIME_POLICY also applies)",
+    )
     install.set_defaults(func=_cmd_install_service)
 
     uninstall = sub.add_parser("uninstall-service", help="remove the scheduled sweep service")

@@ -4,6 +4,58 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-06-27
+
+### Added
+- Current-directory target resolution from the `.ephemdir` marker. `keep`,
+  `rm`, `explain` and `extend` can now operate on the ephemdir directory you are
+  standing in (or any subdirectory of it) without an explicit name or path; the
+  target is always the managed root. They act only when the nearest `.ephemdir`
+  marker matches an active tracked entry by marker id and inode, and otherwise
+  fail closed rather than guessing.
+- `ephemdir extend` accepts a bare lifetime when run inside a tracked directory:
+  `ephemdir extend 30m` and `ephemdir extend --forever` extend the current
+  directory, while `ephemdir extend <name> 30m` keeps working as before.
+- `ephemdir path` now prefers the current ephemdir directory when run from
+  inside one, preserving the most-recently-created fallback when run from
+  outside. A present-but-invalid marker makes `path` fail closed instead of
+  falling back.
+
+### Changed
+- `install-service` now has a runtime-trust policy, selectable with
+  `--runtime-policy strict|balanced` (or the `EPHEMDIR_SERVICE_RUNTIME_POLICY`
+  environment variable). `balanced` is the default on macOS and `strict` the
+  default on Linux. `balanced` allows a group-writable directory ancestor of
+  the service runtime only as a narrow Homebrew/usr-local carve-out — macOS, a
+  path under `/opt/homebrew` or `/usr/local`, owned by root or you, not
+  world-writable, and whose owning group is a local administrator group
+  (`admin`) — emitting a warning. This lets a stock Homebrew interpreter host
+  the scheduled sweep, while a group-writable directory owned by an ordinary
+  shared group (which could contain another local user) is still rejected.
+  World-writable components, foreign-owned components, symlinked package
+  subdirectories, and group/world-writable executable files or
+  interpreter-startup hooks remain hard failures under both policies.
+
+### Fixed
+- Directories were never removed after a reboot. The ownership identity check
+  compared the stored device number (`st_dev`) as well as the inode, but a
+  device number is not stable across reboots (macOS reassigns it for an APFS
+  volume at every boot, and it is not guaranteed stable on Linux). After a
+  restart every tracked directory therefore looked like a replacement and was
+  left untouched, defeating restart and expiry cleanup. The identity check now
+  compares the inode number only; the random ownership marker remains the
+  primary proof, and a directory replaced at the same path still gets a new
+  inode and is still detected. Within-operation safety checks (fd-relative
+  delete, mount-boundary detection) are unchanged and continue to use the full
+  device+inode pair.
+- The scheduled sweep service could not be installed from a default Homebrew
+  Python on macOS, because the previous, unconditional rejection of any
+  group-writable runtime component refused `/opt/homebrew/Cellar`. Without an
+  installed service, periodic and post-reboot cleanup never ran automatically.
+  The new default `balanced` policy installs successfully on a stock Homebrew
+  setup while keeping the strict behaviour available. (Together with the inode
+  fix above, this is what restores automatic post-reboot cleanup on macOS.)
+
 ## [0.5.0] - 2026-06-18
 
 ### Added

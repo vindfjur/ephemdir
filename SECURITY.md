@@ -2,9 +2,9 @@
 
 ## Supported Versions
 
-The supported release lines are `0.4.x` and `0.5.x`. Supported runtimes are
-Python 3.10+ on Linux and macOS. Windows is not supported until a handle-bound
-recursive deletion backend is available.
+The supported release line is `0.6.x` (with `0.5.x` still receiving security
+fixes). Supported runtimes are Python 3.10+ on Linux and macOS. Windows is not
+supported until a handle-bound recursive deletion backend is available.
 
 ## Reporting a Vulnerability
 
@@ -49,7 +49,9 @@ unattended, later, as your user. Before writing any unit/plist it verifies that
 the interpreter, the entire `ephemdir` package tree (rejecting symlinked
 package subdirectories) and the interpreter-startup hooks (`.pth` files,
 `sitecustomize`, `pyvenv.cfg`, and `tomli` on Python 3.10) are owned by you or
-root and not writable by other users.
+root. A **world-writable** component, a **foreign-owned** component, a
+symlinked package subdirectory, and any group/world-writable **executable**
+file or startup hook are always rejected, under every policy.
 It also pins the verified effective `EPHEMDIR_DATA_DIR` and
 `EPHEMDIR_CONFIG_DIR` into the installed launchd/systemd definition so the
 scheduled sweep does not drift to a different registry after logout/login or
@@ -67,8 +69,43 @@ confirm the environment's ownership and permissions before scheduling sweeps.
 One-off interactive `tempdir()`, `ephemdir sweep` and the rest of the CLI do not
 rely on this and are unaffected.
 
-On macOS, a Homebrew or shared Python runtime can be rejected for scheduled
-service use when any runtime component is group/world-writable. That rejection
-is intentional; launchd runs the interpreter later, after the current shell is
-gone. A safe pattern is to install the service from a private uv-managed venv
-under the user's home directory.
+### Runtime-trust policy: `strict` vs `balanced`
+
+The one place the policy is configurable is how a **group-writable directory
+ancestor** of the runtime is treated. This is governed by
+`--runtime-policy strict|balanced` (or `EPHEMDIR_SERVICE_RUNTIME_POLICY`).
+
+* **`strict`** rejects any group-writable component. It is the default on every
+  platform except macOS and is the correct choice on a genuinely shared
+  multi-user host.
+* **`balanced`** (the default on macOS) allows a group-writable directory
+  ancestor only as a narrow, property-checked Homebrew/usr-local carve-out, with
+  a warning. **All** of the following must hold, or the component is rejected:
+  the platform is macOS; the resolved path is under `/opt/homebrew` or
+  `/usr/local`; the directory is owned by root or the installing user; it is not
+  world-writable; and its **owning group is a local administrator group**
+  (`admin`, gid 80). This reflects the single-user model: the `admin` group on a
+  personal Mac is the owner, not an attacker. It exists because a stock Homebrew
+  interpreter lives under `/opt/homebrew/Cellar` (mode `0775`, group `admin`);
+  under `strict` that ancestor is refused, which silently prevents the scheduled
+  sweep from ever being installed — and therefore prevents reboot/expiry cleanup
+  from running automatically.
+
+The owning-group check is the load-bearing restriction: POSIX write permission
+on a directory lets any member of its group replace entries inside it, so a
+group-writable directory on the import path whose group could contain a
+*different* unprivileged user would be a code-execution vector for the scheduled
+service. Restricting the carve-out to the local `admin` group (plus the prefix
+allowlist) keeps the relaxation within the threat model. A group-writable
+directory owned by an ordinary shared group is rejected even under `balanced`.
+
+`balanced` relaxes **only** group-writable *directory ancestors* that pass that
+carve-out. World-writable components, foreign-owned components, symlinked
+package subdirectories, and group/world-writable *executable* files or startup
+hooks remain hard failures under both policies. If you prefer `strict`
+everywhere, install the service from a private uv-managed venv under your home
+directory, whose components are owned only by you.
+
+This threat model deliberately excludes root, the local administrator, and
+other members of the owner's own `admin` group on a personal machine; it
+defends against a different unprivileged local user, not against the owner.

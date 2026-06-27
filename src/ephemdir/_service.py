@@ -29,13 +29,21 @@ import subprocess  # nosec B404
 import sys
 import uuid
 from collections.abc import Iterator
+from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 from ._platform import user_config_dir, user_data_dir
 from ._security import open_private_directory
 from ._trusted_exec import resolve_executable_in_dirs, trusted_system_dirs
 
-__all__ = ["ServiceError", "install_service", "uninstall_service", "sweep_command"]
+__all__ = [
+    "ServiceError",
+    "RuntimePolicy",
+    "install_service",
+    "uninstall_service",
+    "sweep_command",
+]
 
 # Scheduler/runtime subprocesses use fixed argv, trusted resolution and no shell.
 
@@ -55,6 +63,79 @@ class ServiceError(RuntimeError):
 # can never stall an install or uninstall indefinitely.
 _SCHEDULER_TIMEOUT_SECONDS = 30
 _SERVICE_FILE_MODE = 0o600
+
+# Environment override for the runtime-trust policy applied to install-service.
+_RUNTIME_POLICY_ENV = "EPHEMDIR_SERVICE_RUNTIME_POLICY"
+
+
+class RuntimePolicy(str, Enum):
+    """How strictly ``install-service`` validates the interpreter/package runtime.
+
+    Both policies hard-fail on the real takeover vectors in ephemdir's
+    single-user POSIX threat model: a world-writable component, a component
+    owned by another user, a symlinked package subdirectory, and any
+    group/world-writable *executable* file or interpreter-startup hook. They
+    differ on one point only.
+
+    ``strict`` additionally rejects any group-writable *directory* ancestor.
+    This is correct on a genuinely shared multi-user host, but on a normal
+    single-user macOS box it rejects every default Homebrew interpreter, whose
+    ``/opt/homebrew/Cellar`` ancestor is group-writable by ``admin`` (i.e. by
+    the owner). That refusal silently prevents the scheduled sweep from ever
+    being installed, so reboot/expiry cleanup never runs automatically.
+
+    ``balanced`` allows a group-writable directory ancestor only as a narrow
+    macOS carve-out — when :func:`_is_trusted_homebrew_group_writable_dir`
+    passes: macOS, a directory owned by root or you, not world-writable, whose
+    owning group is a local administrator group (``admin``) and whose resolved
+    path is under ``/opt/homebrew`` or ``/usr/local``. It emits a warning. A
+    group-writable directory owned by an ordinary shared group (which could
+    contain another unprivileged user) is rejected, and every other vector
+    stays a hard failure.
+    """
+
+    STRICT = "strict"
+    BALANCED = "balanced"
+
+
+@dataclass
+class _RuntimeCheck:
+    """Carries the active policy and de-duplicated warnings through validation."""
+
+    policy: RuntimePolicy
+    warnings: dict[str, None] = field(default_factory=dict)
+
+    def warn(self, message: str) -> None:
+        self.warnings.setdefault(message, None)
+
+
+def _resolve_runtime_policy(explicit: str | RuntimePolicy | None) -> RuntimePolicy:
+    """Resolve the runtime policy from explicit arg, env, then platform default.
+
+    Precedence: an explicit ``--runtime-policy`` value wins, then
+    ``EPHEMDIR_SERVICE_RUNTIME_POLICY``, then the platform default (macOS is
+    ``balanced`` so a stock Homebrew install works; every other platform is
+    ``strict``).
+    """
+    if explicit is not None:
+        return _coerce_runtime_policy(explicit, source="--runtime-policy")
+    env_value = os.environ.get(_RUNTIME_POLICY_ENV)
+    if env_value:
+        return _coerce_runtime_policy(env_value, source=_RUNTIME_POLICY_ENV)
+    if sys.platform == "darwin":
+        return RuntimePolicy.BALANCED
+    return RuntimePolicy.STRICT
+
+
+def _coerce_runtime_policy(value: str | RuntimePolicy, *, source: str) -> RuntimePolicy:
+    if isinstance(value, RuntimePolicy):
+        return value
+    try:
+        return RuntimePolicy(value.strip().lower())
+    except ValueError:
+        raise ServiceError(
+            f"invalid {source} value {value!r}: expected 'strict' or 'balanced'"
+        ) from None
 
 
 def _trusted_scheduler_dirs() -> tuple[Path, ...]:
@@ -270,8 +351,77 @@ def _write_service_file(path: Path, content: str) -> None:
         os.close(dir_fd)
 
 
-def _writable_by_other_users(mode: int) -> bool:
-    return bool(mode & (stat.S_IWGRP | stat.S_IWOTH))
+
+# The balanced policy tolerates a group-writable *directory* ancestor only as a
+# narrow macOS carve-out: the resolved path lives under one of these package-
+# manager prefixes AND its owning group is a local administrator group (admin).
+# /opt/homebrew/Cellar is mode 0775, group admin — writable only by machine
+# administrators, who on a personal Mac are the owner. A group-writable
+# directory whose owning group might contain a *different* unprivileged user (a
+# shared "project" group) is deliberately NOT covered: that user is in scope and
+# could replace a directory on the import path, gaining code execution as the
+# installing user when the scheduled sweep runs.
+_GROUP_WRITABLE_PREFIX_ALLOWLIST: tuple[str, ...] = ("/opt/homebrew", "/usr/local")
+_ADMIN_GROUP_NAMES: tuple[str, ...] = ("admin",)
+_ADMIN_GROUP_FALLBACK_GIDS: frozenset[int] = frozenset({80})  # macOS `admin`
+
+
+def _trusted_admin_gids() -> frozenset[int]:
+    """Return gids of local administrator groups the carve-out may trust."""
+    gids = set(_ADMIN_GROUP_FALLBACK_GIDS)
+    try:
+        import grp
+    except ImportError:  # pragma: no cover - non-POSIX
+        return frozenset(gids)
+    for name in _ADMIN_GROUP_NAMES:
+        try:
+            gids.add(grp.getgrnam(name).gr_gid)
+        except KeyError:  # pragma: no cover - admin group absent
+            continue
+    return frozenset(gids)
+
+
+def _within_allowlisted_prefix(path: Path) -> bool:
+    """Whether ``path`` resolves to within an allowlisted package-manager prefix."""
+    try:
+        real = path.resolve(strict=True)
+    except OSError:  # pragma: no cover - component vanished mid-check
+        return False
+    for prefix in _GROUP_WRITABLE_PREFIX_ALLOWLIST:
+        prefix_path = Path(prefix)
+        if real == prefix_path or prefix_path in real.parents:
+            return True
+    return False
+
+
+def _is_trusted_homebrew_group_writable_dir(current: Path, info: os.stat_result) -> bool:
+    """Whether ``balanced`` may tolerate this group-writable directory.
+
+    Only the macOS Homebrew / usr-local carve-out qualifies: macOS, a real
+    directory, owning group is a local admin group, and the resolved path lives
+    under an allowlisted prefix. Any other group-writable directory — including
+    one whose owning group could contain another unprivileged local user — is
+    rejected, so the relaxation never exceeds the documented threat model.
+    """
+    if sys.platform != "darwin":
+        return False
+    if not stat.S_ISDIR(info.st_mode):
+        return False
+    if info.st_gid not in _trusted_admin_gids():
+        return False
+    return _within_allowlisted_prefix(current)
+
+
+def _balanced_policy_hint(check: _RuntimeCheck, current: Path, info: os.stat_result) -> str:
+    """Mention balanced under strict only when the dir actually qualifies for it."""
+    if check.policy is RuntimePolicy.STRICT and _is_trusted_homebrew_group_writable_dir(
+        current, info
+    ):
+        return (
+            " This is a Homebrew/usr-local prefix owned by a local admin group; "
+            "--runtime-policy balanced (the macOS default) allows it."
+        )
+    return ""
 
 
 def _safe_uv_runtime_hint() -> str:
@@ -287,31 +437,55 @@ def _safe_uv_runtime_hint() -> str:
     )
 
 
-def _check_runtime_component(current: Path, info: os.stat_result, description: str) -> None:
+def _check_runtime_component(
+    current: Path, info: os.stat_result, description: str, check: _RuntimeCheck
+) -> None:
     """Reject one runtime path component another local user could replace.
 
-    Group/world-writability is not the only takeover vector: the owner of a
-    component can always rewrite it regardless of its mode, so every
-    component must belong to root or the installing user. A `0755` venv owned
-    by a different local user must never become a scheduled service runtime.
+    Ownership is the primary gate: the owner of a component can always rewrite
+    it regardless of mode, so every component must belong to root or the
+    installing user. World-writable is always fatal. A group-writable
+    *directory* ancestor is fatal under ``strict`` and is fatal under
+    ``balanced`` too, except for the narrow macOS Homebrew/usr-local admin
+    carve-out — when :func:`_is_trusted_homebrew_group_writable_dir` passes —
+    where it is allowed with a warning. A group-writable *file* — an interpreter
+    or importable module — stays fatal under both policies, because that is
+    executable code.
     """
     if stat.S_ISLNK(info.st_mode):
         return  # The resolved chain re-checks what the link points to.
-    if _writable_by_other_users(info.st_mode):
-        raise ServiceError(
-            f"refusing to install service: {description} {current} is "
-            "group/world-writable (writable by other users); shared directories "
-            "like /tmp cannot host a scheduled service runtime, sticky bit or not."
-            f"{_safe_uv_runtime_hint()}"
-        )
     if hasattr(os, "geteuid") and info.st_uid not in (0, os.geteuid()):
         raise ServiceError(
             f"refusing to install service: {description} {current} is "
             "owned by another user"
         )
+    if info.st_mode & stat.S_IWOTH:
+        raise ServiceError(
+            f"refusing to install service: {description} {current} is "
+            "world-writable (writable by any local user); shared directories "
+            "like /tmp cannot host a scheduled service runtime, sticky bit or not."
+            f"{_safe_uv_runtime_hint()}"
+        )
+    if info.st_mode & stat.S_IWGRP:
+        if check.policy is RuntimePolicy.BALANCED and _is_trusted_homebrew_group_writable_dir(
+            current, info
+        ):
+            check.warn(
+                f"service runtime uses group-writable Homebrew/usr-local path "
+                f"component {current} (owning group is a local admin group); "
+                "allowed by --runtime-policy balanced. Use --runtime-policy "
+                "strict to fail closed."
+            )
+            return
+        raise ServiceError(
+            f"refusing to install service: {description} {current} is "
+            "group-writable (writable by other users in its group)."
+            f"{_balanced_policy_hint(check, current, info)}"
+            f"{_safe_uv_runtime_hint()}"
+        )
 
 
-def _validate_runtime_chain(absolute: Path, label: str) -> os.stat_result:
+def _validate_runtime_chain(absolute: Path, label: str, check: _RuntimeCheck) -> os.stat_result:
     """Validate every ancestor of ``absolute`` (lexical and resolved).
 
     Each component must resist replacement by other local users. Returns the
@@ -326,7 +500,7 @@ def _validate_runtime_chain(absolute: Path, label: str) -> os.stat_result:
             info = os.lstat(current)
         except OSError as error:
             raise ServiceError(f"cannot verify {label} path {current}: {error}") from error
-        _check_runtime_component(current, info, f"{label} path component")
+        _check_runtime_component(current, info, f"{label} path component", check)
 
     try:
         resolved = absolute.resolve(strict=True)
@@ -343,7 +517,7 @@ def _validate_runtime_chain(absolute: Path, label: str) -> os.stat_result:
                 raise ServiceError(
                     f"cannot verify resolved {label} path {current}: {error}"
                 ) from error
-            _check_runtime_component(current, info, f"resolved {label} path component")
+            _check_runtime_component(current, info, f"resolved {label} path component", check)
 
     try:
         return os.stat(absolute)
@@ -351,7 +525,7 @@ def _validate_runtime_chain(absolute: Path, label: str) -> os.stat_result:
         raise ServiceError(f"cannot stat {label} path {absolute}: {error}") from error
 
 
-def _validate_runtime_path(path: Path, label: str) -> None:
+def _validate_runtime_path(path: Path, label: str, check: _RuntimeCheck) -> None:
     """Reject service runtime paths another local user could swap or edit.
 
     A scheduled job persists beyond the current shell, so every existing path
@@ -361,14 +535,14 @@ def _validate_runtime_path(path: Path, label: str) -> None:
     remain supported.
     """
     absolute = Path(os.path.abspath(path))
-    final_info = _validate_runtime_chain(absolute, label)
+    final_info = _validate_runtime_chain(absolute, label, check)
     if not stat.S_ISREG(final_info.st_mode):
         raise ServiceError(f"refusing to install service: {label} is not a regular file")
     if hasattr(os, "geteuid") and final_info.st_uid not in (0, os.geteuid()):
         raise ServiceError(f"refusing to install service: {label} is owned by another user")
 
 
-def _validate_runtime_dir(path: Path, label: str) -> None:
+def _validate_runtime_dir(path: Path, label: str, check: _RuntimeCheck) -> None:
     """Reject a runtime *directory* another local user could swap or populate.
 
     Unlike :func:`_validate_runtime_path`, the final component must be a real
@@ -379,17 +553,15 @@ def _validate_runtime_dir(path: Path, label: str) -> None:
     load. Validating the directory itself closes that gap.
     """
     absolute = Path(os.path.abspath(path))
-    final_info = _validate_runtime_chain(absolute, label)
+    final_info = _validate_runtime_chain(absolute, label, check)
     if not stat.S_ISDIR(final_info.st_mode):
         raise ServiceError(f"refusing to install service: {label} is not a directory")
-    if _writable_by_other_users(final_info.st_mode):
-        raise ServiceError(
-            f"refusing to install service: {label} {absolute} is "
-            "group/world-writable (writable by other users)."
-            f"{_safe_uv_runtime_hint()}"
-        )
-    if hasattr(os, "geteuid") and final_info.st_uid not in (0, os.geteuid()):
-        raise ServiceError(f"refusing to install service: {label} is owned by another user")
+    # Re-apply the per-component policy to the resolved directory itself (the
+    # chain validated it through lstat; this covers the symlink-followed
+    # target). Balanced relaxes a group-writable directory here only when it
+    # passes the macOS Homebrew/usr-local admin carve-out
+    # (_is_trusted_homebrew_group_writable_dir); otherwise it is rejected.
+    _check_runtime_component(absolute, final_info, label, check)
 
 
 # Files the interpreter can load and execute as the service user. A `.py`
@@ -398,7 +570,7 @@ def _validate_runtime_dir(path: Path, label: str) -> None:
 _EXECUTABLE_MODULE_SUFFIXES = (".py", ".pyc", ".pyo", ".so", ".pyd", ".dylib")
 
 
-def _validate_package_tree(package_dir: Path) -> None:
+def _validate_package_tree(package_dir: Path, check: _RuntimeCheck) -> None:
     """Verify every importable module under the package resists local tampering.
 
     ``python -I -m ephemdir sweep`` imports far more than one entry point:
@@ -427,7 +599,7 @@ def _validate_package_tree(package_dir: Path) -> None:
         # foreign `__pycache__` -- has nothing to validate indirectly today,
         # but its owner can later drop an unchecked `.pyc` the interpreter would
         # load.
-        _validate_runtime_dir(root_path, "ephemdir package directory")
+        _validate_runtime_dir(root_path, "ephemdir package directory", check)
         for name in list(dirs):
             sub = root_path / name
             # os.walk does not descend into a symlinked subdirectory, so a
@@ -443,11 +615,11 @@ def _validate_package_tree(package_dir: Path) -> None:
             # Validate each subdirectory *now*, before os.walk tries to descend.
             # An inaccessible or foreign-owned subdir is caught here (or by the
             # onerror handler above) rather than slipping through unvalidated.
-            _validate_runtime_dir(sub, "ephemdir package directory")
+            _validate_runtime_dir(sub, "ephemdir package directory", check)
         for name in files:
             file_path = root_path / name
             if file_path.suffix in _EXECUTABLE_MODULE_SUFFIXES:
-                _validate_runtime_path(file_path, "ephemdir module")
+                _validate_runtime_path(file_path, "ephemdir module", check)
                 validated = True
     if not validated:
         raise ServiceError(
@@ -510,10 +682,10 @@ def _iter_startup_files() -> Iterator[tuple[Path, str]]:
         yield pyvenv_cfg, "pyvenv.cfg"
 
 
-def _validate_startup_environment() -> None:
+def _validate_startup_environment(check: _RuntimeCheck) -> None:
     """Verify interpreter-startup hooks resist tampering by other local users."""
     for path, label in _iter_startup_files():
-        _validate_runtime_path(path, label)
+        _validate_runtime_path(path, label, check)
 
     # On Python 3.10 the sweep imports `tomli` for TOML config; the whole
     # package runs as the service user, so validate every module in it.
@@ -523,13 +695,13 @@ def _validate_startup_environment() -> None:
         except (ImportError, AttributeError, ValueError):  # pragma: no cover - defensive
             tomli_spec = None
         if tomli_spec is not None and tomli_spec.origin:
-            _validate_package_tree(Path(tomli_spec.origin).resolve().parent)
+            _validate_package_tree(Path(tomli_spec.origin).resolve().parent, check)
 
 
-def _validate_service_runtime() -> None:
-    _validate_runtime_path(Path(sys.executable), "Python interpreter")
-    _validate_package_tree(Path(__file__).resolve().parent)
-    _validate_startup_environment()
+def _validate_service_runtime(check: _RuntimeCheck) -> None:
+    _validate_runtime_path(Path(sys.executable), "Python interpreter", check)
+    _validate_package_tree(Path(__file__).resolve().parent, check)
+    _validate_startup_environment(check)
 
 
 def _reject_elevated_user_install() -> None:
@@ -885,8 +1057,18 @@ def _uninstall_windows() -> str:
 
 # --- Public dispatch -------------------------------------------------------
 
-def install_service(interval: int = 600) -> str:
+def install_service(
+    interval: int = 600,
+    *,
+    runtime_policy: str | RuntimePolicy | None = None,
+) -> str:
     """Install the periodic sweep service for the current platform.
+
+    ``runtime_policy`` selects how strictly the interpreter/package runtime is
+    validated (see :class:`RuntimePolicy`); ``None`` resolves it from the
+    ``EPHEMDIR_SERVICE_RUNTIME_POLICY`` env var, then the platform default
+    (``balanced`` on macOS, ``strict`` elsewhere). Any relaxation taken under
+    ``balanced`` is logged as a warning.
 
     Raises :class:`ServiceError` when the platform scheduler reports failure,
     so a broken installation is never reported as success.
@@ -899,8 +1081,11 @@ def install_service(interval: int = 600) -> str:
             "Windows is unsupported because Python does not expose the "
             "handle-bound recursive deletion primitives ephemdir requires"
         )
-    _validate_service_runtime()
+    check = _RuntimeCheck(policy=_resolve_runtime_policy(runtime_policy))
+    _validate_service_runtime(check)
     _verify_isolated_import()
+    for warning in check.warnings:
+        logger.warning("%s", warning)
     if sys.platform == "darwin":
         return _install_launchd(interval)
     return _install_systemd(interval)
