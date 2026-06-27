@@ -338,6 +338,7 @@ ephemdir new --lifetime 2h       # with a lifetime
 ephemdir new --keep-on-restart   # do not remove on restart
 ephemdir list                    # tracked directories, status and time left
 ephemdir path brave-otter        # print a tracked directory's path
+ephemdir explain brave-otter     # why a directory is (or isn't) due for cleanup
 ephemdir keep brave-otter        # liked it? stop tracking, keep forever
 ephemdir extend brave-otter 2h   # fresh lifetime from now (--forever: no limit)
 ephemdir rm brave-otter          # remove a tracked directory now
@@ -352,9 +353,11 @@ ephemdir uninstall-service       # remove the scheduled service
 ```
 
 Every command that takes a directory accepts a full path, the exact name or a
-unique prefix (`bra` or `brave-otter` for `brave-otter-a81f42c9d047315b`).
-Add `-v` for more output or `-q` to
-stay quiet.
+unique prefix (`bra` or `brave-otter` for `brave-otter-a81f42c9d047315b`). For
+`path`, `explain`, `keep`, `extend` and `rm` the name is optional when you are
+inside a tracked directory — see [Managing the current
+directory](#managing-the-current-directory) below. Add `-v` for more output or
+`-q` to stay quiet.
 
 ### Managing the current directory
 
