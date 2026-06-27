@@ -12,10 +12,19 @@ from ephemdir import _service
 from ephemdir._service import (
     LAUNCHD_LABEL,
     SYSTEMD_UNIT,
+    RuntimePolicy,
     render_launchd_plist,
     render_systemd_units,
     sweep_command,
 )
+
+
+def _strict_check() -> _service._RuntimeCheck:
+    return _service._RuntimeCheck(policy=RuntimePolicy.STRICT)
+
+
+def _balanced_check() -> _service._RuntimeCheck:
+    return _service._RuntimeCheck(policy=RuntimePolicy.BALANCED)
 
 
 def test_sweep_command_uses_current_interpreter_in_isolated_mode():
@@ -408,10 +417,10 @@ def test_runtime_path_and_dir_type_checks(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "stat", _synthetic_lstat(os.stat))
 
     with pytest.raises(_service.ServiceError, match="not a regular file"):
-        _service._validate_runtime_path(directory, "runtime")
+        _service._validate_runtime_path(directory, "runtime", _strict_check())
 
     with pytest.raises(_service.ServiceError, match="not a directory"):
-        _service._validate_runtime_dir(file_path, "runtime dir")
+        _service._validate_runtime_dir(file_path, "runtime dir", _strict_check())
 
 
 @pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlink support required")
@@ -539,8 +548,8 @@ def test_runtime_path_rejects_other_user_writable_component(tmp_path):
     runtime.write_text("placeholder", encoding="utf-8")
     runtime.chmod(0o666)
 
-    with pytest.raises(_service.ServiceError, match="group/world-writable"):
-        _service._validate_runtime_path(runtime, "test runtime")
+    with pytest.raises(_service.ServiceError, match="world-writable"):
+        _service._validate_runtime_path(runtime, "test runtime", _strict_check())
 
 
 def test_runtime_component_rejects_sticky_shared_temp_dir():
@@ -548,11 +557,14 @@ def test_runtime_component_rejects_sticky_shared_temp_dir():
         (stat.S_IFDIR | 0o1777, 1, 2, 1, 0, 0, 0, 0, 0, 0)
     )
 
-    with pytest.raises(_service.ServiceError, match="group/world-writable"):
+    # A world-writable directory is rejected even under balanced — sticky or not,
+    # /tmp can never host a scheduled service runtime.
+    with pytest.raises(_service.ServiceError, match="world-writable"):
         _service._check_runtime_component(
             Path("/tmp"),
             sticky_tmp,
             "test runtime path component",
+            _balanced_check(),
         )
 
 
@@ -567,10 +579,11 @@ def test_runtime_error_recommends_safe_uv_managed_venv():
             Path("/tmp"),
             writable,
             "test runtime path component",
+            _strict_check(),
         )
 
     message = str(exc_info.value)
-    assert "group/world-writable" in message
+    assert "world-writable" in message
     assert "uv python install 3.12" in message
     assert "uv venv ~/.venvs/ephemdir-safe --python 3.12" in message
     assert "uv pip install --python ~/.venvs/ephemdir-safe/bin/python ephemdir" in message
@@ -614,7 +627,7 @@ def test_runtime_path_rejects_foreign_owned_0755_component(tmp_path, monkeypatch
 
     monkeypatch.setattr(os, "lstat", _synthetic_lstat(os.lstat, foreign=(venv,)))
     with pytest.raises(_service.ServiceError, match="component .* owned by another user"):
-        _service._validate_runtime_path(runtime, "test runtime")
+        _service._validate_runtime_path(runtime, "test runtime", _strict_check())
 
 
 @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="POSIX ownership semantics required")
@@ -639,7 +652,7 @@ def test_runtime_path_rejects_foreign_owned_final_file(tmp_path, monkeypatch):
 
     monkeypatch.setattr(os, "stat", foreign_final_stat)
     with pytest.raises(_service.ServiceError, match="test runtime is owned by another user"):
-        _service._validate_runtime_path(runtime, "test runtime")
+        _service._validate_runtime_path(runtime, "test runtime", _strict_check())
 
 
 @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="POSIX ownership semantics required")
@@ -652,14 +665,16 @@ def test_check_runtime_component_rejects_foreign_owner():
     from pathlib import Path
 
     with pytest.raises(_service.ServiceError, match="owned by another user"):
-        _service._check_runtime_component(Path("/synthetic"), foreign, "test component")
+        _service._check_runtime_component(
+            Path("/synthetic"), foreign, "test component", _strict_check()
+        )
 
 
 def test_install_service_validates_persistent_runtime(monkeypatch):
     monkeypatch.setattr(_service.sys, "platform", "linux")
     monkeypatch.setattr(_service, "_reject_elevated_user_install", lambda: None)
 
-    def reject():
+    def reject(check):
         raise _service.ServiceError("unsafe persistent runtime")
 
     monkeypatch.setattr(_service, "_validate_service_runtime", reject)
@@ -678,7 +693,7 @@ def test_install_service_rejects_root_user(monkeypatch):
 def test_install_service_dispatches_linux_after_validation(monkeypatch):
     monkeypatch.setattr(_service.sys, "platform", "linux")
     monkeypatch.setattr(_service, "_reject_elevated_user_install", lambda: None)
-    monkeypatch.setattr(_service, "_validate_service_runtime", lambda: None)
+    monkeypatch.setattr(_service, "_validate_service_runtime", lambda check: None)
     monkeypatch.setattr(_service, "_verify_isolated_import", lambda: None)
     monkeypatch.setattr(_service, "_install_systemd", lambda interval: f"linux:{interval}")
 
@@ -688,7 +703,7 @@ def test_install_service_dispatches_linux_after_validation(monkeypatch):
 def test_install_service_dispatches_darwin_after_validation(monkeypatch):
     monkeypatch.setattr(_service.sys, "platform", "darwin")
     monkeypatch.setattr(_service, "_reject_elevated_user_install", lambda: None)
-    monkeypatch.setattr(_service, "_validate_service_runtime", lambda: None)
+    monkeypatch.setattr(_service, "_validate_service_runtime", lambda check: None)
     monkeypatch.setattr(_service, "_verify_isolated_import", lambda: None)
     monkeypatch.setattr(_service, "_install_launchd", lambda interval: f"darwin:{interval}")
 
@@ -918,9 +933,11 @@ def test_startup_file_iteration_and_tomli_validation(tmp_path, monkeypatch):
         "find_spec",
         lambda name: type("Spec", (), {"origin": str(tomli)})() if name == "tomli" else None,
     )
-    monkeypatch.setattr(_service, "_validate_package_tree", lambda path: checked.append(path))
+    monkeypatch.setattr(
+        _service, "_validate_package_tree", lambda path, check: checked.append(path)
+    )
 
-    _service._validate_startup_environment()
+    _service._validate_startup_environment(_strict_check())
 
     assert checked == [tomli.parent]
 
@@ -930,20 +947,20 @@ def test_validate_service_runtime_checks_interpreter_package_and_startup(monkeyp
     monkeypatch.setattr(
         _service,
         "_validate_runtime_path",
-        lambda path, label: calls.append(f"path:{label}"),
+        lambda path, label, check: calls.append(f"path:{label}"),
     )
     monkeypatch.setattr(
         _service,
         "_validate_package_tree",
-        lambda path: calls.append("package"),
+        lambda path, check: calls.append("package"),
     )
     monkeypatch.setattr(
         _service,
         "_validate_startup_environment",
-        lambda: calls.append("startup"),
+        lambda check: calls.append("startup"),
     )
 
-    _service._validate_service_runtime()
+    _service._validate_service_runtime(_strict_check())
 
     assert calls == ["path:Python interpreter", "package", "startup"]
 
@@ -969,12 +986,14 @@ def test_validate_package_tree_checks_every_module(tmp_path, monkeypatch):
     pkg = _make_fake_package(tmp_path)
     checked: list[str] = []
     monkeypatch.setattr(
-        _service, "_validate_runtime_path", lambda path, label: checked.append(Path(path).name)
+        _service,
+        "_validate_runtime_path",
+        lambda path, label, check: checked.append(Path(path).name),
     )
     # The per-directory check is exercised separately; here we test file walking.
-    monkeypatch.setattr(_service, "_validate_runtime_dir", lambda path, label: None)
+    monkeypatch.setattr(_service, "_validate_runtime_dir", lambda path, label, check: None)
 
-    _service._validate_package_tree(pkg)
+    _service._validate_package_tree(pkg, _strict_check())
 
     for required in ("__main__.py", "cli.py", "core.py", "_registry.py"):
         assert required in checked
@@ -988,14 +1007,14 @@ def test_validate_package_tree_rejects_writable_module(tmp_path, monkeypatch):
     # the install even when __init__.py and the directories are locked down.
     pkg = _make_fake_package(tmp_path)
 
-    def fake_validate(path, label):
+    def fake_validate(path, label, check):
         if Path(path).name == "__main__.py":
             raise _service.ServiceError(f"{path} is writable by other users")
 
     monkeypatch.setattr(_service, "_validate_runtime_path", fake_validate)
-    monkeypatch.setattr(_service, "_validate_runtime_dir", lambda path, label: None)
+    monkeypatch.setattr(_service, "_validate_runtime_dir", lambda path, label, check: None)
     with pytest.raises(_service.ServiceError, match="writable by other users"):
-        _service._validate_package_tree(pkg)
+        _service._validate_package_tree(pkg, _strict_check())
 
 
 def test_validate_package_tree_rejects_symlinked_subdir(tmp_path, monkeypatch):
@@ -1011,10 +1030,10 @@ def test_validate_package_tree_rejects_symlinked_subdir(tmp_path, monkeypatch):
     shutil.rmtree(pkg / "__pycache__")
     (pkg / "__pycache__").symlink_to(outside, target_is_directory=True)
 
-    monkeypatch.setattr(_service, "_validate_runtime_path", lambda path, label: None)
-    monkeypatch.setattr(_service, "_validate_runtime_dir", lambda path, label: None)
+    monkeypatch.setattr(_service, "_validate_runtime_path", lambda path, label, check: None)
+    monkeypatch.setattr(_service, "_validate_runtime_dir", lambda path, label, check: None)
     with pytest.raises(_service.ServiceError, match="symlinked subdirectory"):
-        _service._validate_package_tree(pkg)
+        _service._validate_package_tree(pkg, _strict_check())
 
 
 @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="POSIX ownership semantics required")
@@ -1033,12 +1052,12 @@ def test_validate_package_tree_rejects_foreign_owned_empty_subdir(tmp_path, monk
     monkeypatch.setattr(os, "lstat", _synthetic_lstat(real_lstat, foreign=(cache,)))
     monkeypatch.setattr(os, "stat", _synthetic_lstat(real_stat, foreign=(cache,)))
     with pytest.raises(_service.ServiceError, match="owned by another user"):
-        _service._validate_package_tree(pkg)
+        _service._validate_package_tree(pkg, _strict_check())
 
     # Positive control: the same tree with no foreign directory validates.
     monkeypatch.setattr(os, "lstat", _synthetic_lstat(real_lstat))
     monkeypatch.setattr(os, "stat", _synthetic_lstat(real_stat))
-    _service._validate_package_tree(pkg)  # must not raise
+    _service._validate_package_tree(pkg, _strict_check())  # must not raise
 
 
 def test_validate_package_tree_fails_closed_on_unreadable_subdir(tmp_path, monkeypatch):
@@ -1055,7 +1074,7 @@ def test_validate_package_tree_fails_closed_on_unreadable_subdir(tmp_path, monke
 
     monkeypatch.setattr(_service.os, "walk", unreadable_walk)
     with pytest.raises(_service.ServiceError, match="cannot inspect package directory"):
-        _service._validate_package_tree(pkg)
+        _service._validate_package_tree(pkg, _strict_check())
 
 
 def test_validate_package_tree_requires_some_module(tmp_path, monkeypatch):
@@ -1063,10 +1082,10 @@ def test_validate_package_tree_requires_some_module(tmp_path, monkeypatch):
     # success without having verified any actual code.
     empty = tmp_path / "empty"
     empty.mkdir()
-    monkeypatch.setattr(_service, "_validate_runtime_path", lambda path, label: None)
-    monkeypatch.setattr(_service, "_validate_runtime_dir", lambda path, label: None)
+    monkeypatch.setattr(_service, "_validate_runtime_path", lambda path, label, check: None)
+    monkeypatch.setattr(_service, "_validate_runtime_dir", lambda path, label, check: None)
     with pytest.raises(_service.ServiceError, match="no ephemdir module files"):
-        _service._validate_package_tree(empty)
+        _service._validate_package_tree(empty, _strict_check())
 
 
 def test_iter_startup_files_includes_site_pth(tmp_path, monkeypatch):
@@ -1090,10 +1109,320 @@ def test_validate_startup_environment_rejects_writable_pth(tmp_path, monkeypatch
     (site_dir / "evil.pth").write_text("import os\n", encoding="utf-8")
     monkeypatch.setattr(_service.site, "getsitepackages", lambda: [str(site_dir)])
 
-    def fake_validate(path, label):
+    def fake_validate(path, label, check):
         if Path(path).name == "evil.pth":
             raise _service.ServiceError(f"{path} is writable by other users")
 
     monkeypatch.setattr(_service, "_validate_runtime_path", fake_validate)
     with pytest.raises(_service.ServiceError, match="writable by other users"):
-        _service._validate_startup_environment()
+        _service._validate_startup_environment(_strict_check())
+
+
+# --- Runtime policy: strict vs balanced (0.6.0) ----------------------------
+
+
+def _own_uid() -> int:
+    return os.geteuid() if hasattr(os, "geteuid") else 0
+
+
+def _dir_stat(mode_bits: int, uid: int) -> os.stat_result:
+    return os.stat_result((stat.S_IFDIR | mode_bits, 1, 2, 1, uid, 0, 0, 0, 0, 0))
+
+
+def _file_stat(mode_bits: int, uid: int) -> os.stat_result:
+    return os.stat_result((stat.S_IFREG | mode_bits, 1, 2, 1, uid, 0, 0, 0, 0, 0))
+
+
+def _sanitize_ancestors_lstat(real, target):
+    """lstat/stat shim: keep the target component real, lock down its ancestors.
+
+    The component under test reports its true mode and owner; every other path
+    reports a root-owned, non-other-writable directory so the result does not
+    depend on where pytest places ``tmp_path`` (often a world-writable /tmp).
+    """
+    target = str(target)
+
+    def fake(path, *args, **kwargs):
+        result = real(path, *args, **kwargs)
+        if str(path) == target:
+            return result
+        values = list(result)
+        values[0] = result.st_mode & ~0o022  # clear group/world write
+        values[4] = 0  # root-owned
+        return os.stat_result(values)
+
+    return fake
+
+
+def test_runtime_policy_default_is_balanced_on_macos(monkeypatch):
+    monkeypatch.delenv(_service._RUNTIME_POLICY_ENV, raising=False)
+    monkeypatch.setattr(_service.sys, "platform", "darwin")
+    assert _service._resolve_runtime_policy(None) is RuntimePolicy.BALANCED
+
+
+def test_runtime_policy_default_is_strict_off_macos(monkeypatch):
+    monkeypatch.delenv(_service._RUNTIME_POLICY_ENV, raising=False)
+    monkeypatch.setattr(_service.sys, "platform", "linux")
+    assert _service._resolve_runtime_policy(None) is RuntimePolicy.STRICT
+
+
+def test_runtime_policy_env_overrides_platform_default(monkeypatch):
+    monkeypatch.setattr(_service.sys, "platform", "darwin")
+    monkeypatch.setenv(_service._RUNTIME_POLICY_ENV, "strict")
+    assert _service._resolve_runtime_policy(None) is RuntimePolicy.STRICT
+
+
+def test_runtime_policy_explicit_overrides_env(monkeypatch):
+    monkeypatch.setenv(_service._RUNTIME_POLICY_ENV, "strict")
+    assert _service._resolve_runtime_policy("balanced") is RuntimePolicy.BALANCED
+
+
+def test_runtime_policy_rejects_invalid_value(monkeypatch):
+    monkeypatch.setenv(_service._RUNTIME_POLICY_ENV, "paranoid")
+    with pytest.raises(_service.ServiceError, match="invalid"):
+        _service._resolve_runtime_policy(None)
+
+
+def _dir_stat_g(mode_bits: int, uid: int, gid: int) -> os.stat_result:
+    return os.stat_result((stat.S_IFDIR | mode_bits, 1, 2, 1, uid, gid, 0, 0, 0, 0))
+
+
+def _enable_homebrew_carveout(monkeypatch, *, gids=frozenset({80}), within=True):
+    """Make the balanced macOS Homebrew/usr-local carve-out apply deterministically."""
+    monkeypatch.setattr(_service.sys, "platform", "darwin")
+    monkeypatch.setattr(_service, "_trusted_admin_gids", lambda: gids)
+    monkeypatch.setattr(_service, "_within_allowlisted_prefix", lambda path: within)
+
+
+def test_within_allowlisted_prefix(tmp_path, monkeypatch):
+    monkeypatch.setattr(_service, "_GROUP_WRITABLE_PREFIX_ALLOWLIST", (str(tmp_path.resolve()),))
+    inside = tmp_path / "Cellar" / "python@3.12"
+    inside.mkdir(parents=True)
+    assert _service._within_allowlisted_prefix(inside)
+    assert not _service._within_allowlisted_prefix(Path("/"))
+
+
+def test_trusted_admin_gids_includes_macos_admin_fallback():
+    assert 80 in _service._trusted_admin_gids()
+
+
+def test_balanced_allows_homebrew_admin_group_writable_dir(monkeypatch):
+    # The carve-out: macOS, /opt/homebrew/Cellar (0775, group admin), owned by you.
+    _enable_homebrew_carveout(monkeypatch)
+    check = _balanced_check()
+    _service._check_runtime_component(
+        Path("/opt/homebrew/Cellar"),
+        _dir_stat_g(0o775, _own_uid(), 80),
+        "Python interpreter path component",
+        check,
+    )
+    assert any("group-writable" in w for w in check.warnings)
+    assert any("--runtime-policy strict" in w for w in check.warnings)
+
+
+def test_balanced_allows_root_owned_homebrew_group_writable_dir(monkeypatch):
+    _enable_homebrew_carveout(monkeypatch)
+    check = _balanced_check()
+    _service._check_runtime_component(
+        Path("/opt/homebrew/Cellar"), _dir_stat_g(0o775, 0, 80), "interpreter path component", check
+    )
+    assert check.warnings
+
+
+def test_balanced_rejects_group_writable_dir_with_nonadmin_group(monkeypatch):
+    # H-01 regression: a shared "project" group may contain a *different*
+    # unprivileged user, who could replace a directory on the import path and
+    # gain code execution as the installing user. A group-writable dir whose
+    # owning group is not a local admin group must be rejected even under
+    # balanced, regardless of being owned by you and under an allowlisted prefix.
+    monkeypatch.setattr(_service.sys, "platform", "darwin")
+    monkeypatch.setattr(_service, "_within_allowlisted_prefix", lambda path: True)
+    info = _dir_stat_g(0o775, _own_uid(), 5000)  # gid 5000 is not an admin group
+    with pytest.raises(_service.ServiceError, match="group-writable"):
+        _service._check_runtime_component(
+            Path("/Users/alice/shared-venv"), info, "interpreter path component", _balanced_check()
+        )
+
+
+def test_balanced_rejects_group_writable_dir_outside_allowlist(monkeypatch):
+    # Admin-owned group but not under /opt/homebrew or /usr/local: not the
+    # Homebrew carve-out, so balanced must still reject it.
+    _enable_homebrew_carveout(monkeypatch, within=False)
+    info = _dir_stat_g(0o775, _own_uid(), 80)
+    with pytest.raises(_service.ServiceError, match="group-writable"):
+        _service._check_runtime_component(
+            Path("/home/user/venv"), info, "interpreter path component", _balanced_check()
+        )
+
+
+def test_balanced_carveout_is_macos_only(monkeypatch):
+    # The relaxation is macOS-specific; on Linux a group-writable dir is rejected
+    # even under an explicit --runtime-policy balanced.
+    monkeypatch.setattr(_service.sys, "platform", "linux")
+    monkeypatch.setattr(_service, "_within_allowlisted_prefix", lambda path: True)
+    info = _dir_stat_g(0o775, _own_uid(), 80)
+    with pytest.raises(_service.ServiceError, match="group-writable"):
+        _service._check_runtime_component(
+            Path("/opt/homebrew/Cellar"), info, "interpreter path component", _balanced_check()
+        )
+
+
+def test_strict_rejects_homebrew_group_writable_component(monkeypatch):
+    _enable_homebrew_carveout(monkeypatch)
+    with pytest.raises(_service.ServiceError, match="group-writable"):
+        _service._check_runtime_component(
+            Path("/opt/homebrew/Cellar"),
+            _dir_stat_g(0o775, _own_uid(), 80),
+            "interpreter path component",
+            _strict_check(),
+        )
+
+
+def test_strict_group_writable_error_mentions_balanced_for_homebrew(monkeypatch):
+    _enable_homebrew_carveout(monkeypatch)
+    with pytest.raises(_service.ServiceError, match="--runtime-policy balanced"):
+        _service._check_runtime_component(
+            Path("/opt/homebrew/Cellar"),
+            _dir_stat_g(0o775, _own_uid(), 80),
+            "interpreter path component",
+            _strict_check(),
+        )
+
+
+def test_strict_group_writable_error_omits_balanced_for_nonhomebrew(monkeypatch):
+    # Don't dangle a balanced hint for a dir balanced would also reject.
+    monkeypatch.setattr(_service.sys, "platform", "darwin")
+    monkeypatch.setattr(_service, "_within_allowlisted_prefix", lambda path: True)
+    with pytest.raises(_service.ServiceError) as exc_info:
+        _service._check_runtime_component(
+            Path("/Users/alice/shared"),
+            _dir_stat_g(0o775, _own_uid(), 5000),
+            "interpreter path component",
+            _strict_check(),
+        )
+    assert "--runtime-policy balanced" not in str(exc_info.value)
+
+
+def test_balanced_rejects_world_writable_component():
+    # World-writable (sticky /tmp) is fatal even under balanced.
+    with pytest.raises(_service.ServiceError, match="world-writable"):
+        _service._check_runtime_component(
+            Path("/tmp"), _dir_stat(0o1777, _own_uid()), "interpreter path component",
+            _balanced_check(),
+        )
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="POSIX ownership semantics required")
+def test_balanced_rejects_foreign_owned_component():
+    foreign = _dir_stat(0o755, os.geteuid() + 1)
+    with pytest.raises(_service.ServiceError, match="owned by another user"):
+        _service._check_runtime_component(
+            Path("/opt/foreign"), foreign, "interpreter path component", _balanced_check()
+        )
+
+
+def test_balanced_rejects_group_writable_executable_file():
+    # A group-writable *file* is executable code (module/.pth), so it stays a
+    # hard failure even under balanced; only directory ancestors are relaxed.
+    info = _file_stat(0o664, _own_uid())
+    with pytest.raises(_service.ServiceError, match="group-writable"):
+        _service._check_runtime_component(
+            Path("/opt/homebrew/.../ephemdir/core.py"),
+            info,
+            "ephemdir module path component",
+            _balanced_check(),
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission semantics required")
+def test_install_service_macos_balanced_allows_homebrew_group_writable_dir(tmp_path, monkeypatch):
+    # End-to-end on a real filesystem: a genuinely group-writable directory in
+    # the carve-out (allowlisted prefix + admin owning group) passes under
+    # balanced (with a warning) and fails under strict.
+    runtime_dir = tmp_path / "Cellar"
+    runtime_dir.mkdir()
+    runtime_dir.chmod(0o775)  # real group-writable bit, owned by the test user
+    real_gid = runtime_dir.stat().st_gid
+
+    monkeypatch.setattr(_service.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        _service, "_GROUP_WRITABLE_PREFIX_ALLOWLIST", (str(tmp_path.resolve()),)
+    )
+    monkeypatch.setattr(_service, "_trusted_admin_gids", lambda: frozenset({real_gid}))
+    monkeypatch.setattr(os, "lstat", _sanitize_ancestors_lstat(os.lstat, runtime_dir))
+    monkeypatch.setattr(os, "stat", _sanitize_ancestors_lstat(os.stat, runtime_dir))
+
+    balanced = _balanced_check()
+    _service._validate_runtime_dir(runtime_dir, "ephemdir package directory", balanced)
+    assert balanced.warnings  # allowed, but warned
+
+    with pytest.raises(_service.ServiceError, match="group-writable"):
+        _service._validate_runtime_dir(runtime_dir, "ephemdir package directory", _strict_check())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission semantics required")
+def test_install_service_balanced_rejects_group_writable_dir_foreign_group(tmp_path, monkeypatch):
+    # The same allowlisted, group-writable directory is rejected when its owning
+    # group is NOT a trusted admin group (it might contain another local user).
+    runtime_dir = tmp_path / "Cellar"
+    runtime_dir.mkdir()
+    runtime_dir.chmod(0o775)
+
+    monkeypatch.setattr(_service.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        _service, "_GROUP_WRITABLE_PREFIX_ALLOWLIST", (str(tmp_path.resolve()),)
+    )
+    monkeypatch.setattr(_service, "_trusted_admin_gids", lambda: frozenset())  # none trusted
+    monkeypatch.setattr(os, "lstat", _sanitize_ancestors_lstat(os.lstat, runtime_dir))
+    monkeypatch.setattr(os, "stat", _sanitize_ancestors_lstat(os.stat, runtime_dir))
+
+    with pytest.raises(_service.ServiceError, match="group-writable"):
+        _service._validate_runtime_dir(
+            runtime_dir, "ephemdir package directory", _balanced_check()
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission semantics required")
+def test_install_service_balanced_rejects_world_writable_tmp_runtime(tmp_path, monkeypatch):
+    runtime_dir = tmp_path / "shared"
+    runtime_dir.mkdir()
+    runtime_dir.chmod(0o1777)  # sticky, world-writable like /tmp
+
+    monkeypatch.setattr(os, "lstat", _sanitize_ancestors_lstat(os.lstat, runtime_dir))
+    monkeypatch.setattr(os, "stat", _sanitize_ancestors_lstat(os.stat, runtime_dir))
+
+    with pytest.raises(_service.ServiceError, match="world-writable"):
+        _service._validate_runtime_dir(
+            runtime_dir, "ephemdir package directory", _balanced_check()
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission semantics required")
+def test_install_service_balanced_rejects_group_writable_module_file(tmp_path, monkeypatch):
+    module = tmp_path / "core.py"
+    module.write_text("", encoding="utf-8")
+    module.chmod(0o664)  # group-writable regular file == executable code
+
+    monkeypatch.setattr(os, "lstat", _sanitize_ancestors_lstat(os.lstat, module))
+    monkeypatch.setattr(os, "stat", _sanitize_ancestors_lstat(os.stat, module))
+
+    with pytest.raises(_service.ServiceError, match="group-writable"):
+        _service._validate_runtime_path(module, "ephemdir module", _balanced_check())
+
+
+def test_install_service_surfaces_balanced_warning(monkeypatch, caplog):
+    monkeypatch.setattr(_service.sys, "platform", "darwin")
+    monkeypatch.setattr(_service, "_reject_elevated_user_install", lambda: None)
+
+    def validate(check):
+        check.warn("service runtime uses group-writable path component /opt/homebrew/Cellar")
+
+    monkeypatch.setattr(_service, "_validate_service_runtime", validate)
+    monkeypatch.setattr(_service, "_verify_isolated_import", lambda: None)
+    monkeypatch.setattr(_service, "_install_launchd", lambda interval: "installed launchd")
+
+    with caplog.at_level("WARNING", logger="ephemdir"):
+        result = _service.install_service(interval=600, runtime_policy="balanced")
+
+    assert result == "installed launchd"
+    assert any("group-writable" in record.message for record in caplog.records)

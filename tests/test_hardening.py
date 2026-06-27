@@ -1220,3 +1220,60 @@ def test_sweep_refuses_writable_registry_and_keeps_real_directory(tmp_path):
     assert d.path.exists()
     assert registry.path.exists()
     assert not list(tmp_path.glob("registry.json.corrupt-*"))
+
+
+# --- Reboot stability: st_dev is not stable across reboots -------------------
+
+def test_ownership_survives_device_number_change(tmp_path, registry, monkeypatch):
+    # macOS reassigns an APFS volume's st_dev at every boot. The identity check
+    # must compare st_ino only, or every tracked directory would look 'foreign'
+    # after a restart and never be cleaned up (the real 0.6.0 reboot bug).
+    d = tempdir(parent=tmp_path, registry=registry)
+    entry = registered(registry=registry)[str(d.path)]
+    real_stat = os.stat
+
+    def reboot_stat(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if str(path) == str(d.path):
+            values = list(result)
+            values[2] = result.st_dev + 99999  # st_dev (index 2) changes; st_ino stays
+            return os.stat_result(values)
+        return result
+
+    monkeypatch.setattr(core.os, "stat", reboot_stat)
+    assert core._ownership(d.path, entry) == "ours"
+
+
+def test_ownership_still_detects_replacement_by_inode(tmp_path, registry, monkeypatch):
+    # Dropping st_dev must NOT weaken replacement detection: a different st_ino
+    # at the same path (a directory replaced after the entry was recorded) is
+    # still foreign and never auto-deleted.
+    d = tempdir(parent=tmp_path, registry=registry)
+    entry = registered(registry=registry)[str(d.path)]
+    real_stat = os.stat
+
+    def replaced_stat(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if str(path) == str(d.path):
+            values = list(result)
+            values[1] = result.st_ino + 1  # st_ino (index 1) changes
+            return os.stat_result(values)
+        return result
+
+    monkeypatch.setattr(core.os, "stat", replaced_stat)
+    assert core._ownership(d.path, entry) == "foreign"
+
+
+def test_restarted_directory_with_stale_device_number_is_swept(tmp_path, registry, monkeypatch):
+    # End-to-end: a restart renumbers the device, so the entry's recorded dev no
+    # longer matches, but st_ino and the marker do. Restart cleanup must still
+    # delete the directory instead of leaving it tracked-but-foreign forever.
+    d = tempdir(parent=tmp_path, registry=registry)  # remove_on_restart=True by default
+    with registry.transaction() as state:
+        e = state[str(d.path)]
+        e["dev"] = int(e["dev"]) + 99999       # as if written under a previous boot
+        e["boot_id"] = "old-boot-session"
+    monkeypatch.setattr(core, "boot_session_id", lambda: "new-boot-session")
+    assert sweep(registry=registry) == 1
+    assert not d.path.exists()
+    assert str(d.path) not in registered(registry=registry)

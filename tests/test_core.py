@@ -187,14 +187,22 @@ def test_core_inode_and_directory_helpers(tmp_path, monkeypatch):
     info = path.stat()
 
     assert core_module._inode_matches(path, {}) is None
-    assert core_module._inode_matches(path, {"dev": info.st_dev, "ino": info.st_ino}) is True
-    assert core_module._inode_matches(path, {"dev": info.st_dev, "ino": info.st_ino + 1}) is False
-    assert core_module._inode_matches(tmp_path / "missing", {"dev": 1, "ino": 2}) is False
+    assert core_module._inode_matches(path, {"ino": info.st_ino}) is True
+    assert core_module._inode_matches(path, {"ino": info.st_ino + 1}) is False
+    assert core_module._inode_matches(tmp_path / "missing", {"ino": 2}) is False
+    # The device number is deliberately ignored: it is not stable across reboots,
+    # so a stale st_dev with a matching st_ino must still count as a match.
+    assert core_module._inode_matches(
+        path, {"dev": info.st_dev + 9999, "ino": info.st_ino}
+    ) is True
 
     fd = os.open(path, os.O_RDONLY)
     try:
         assert core_module._fd_inode_matches(fd, {}) is None
-        assert core_module._fd_inode_matches(fd, {"dev": info.st_dev, "ino": info.st_ino}) is True
+        assert core_module._fd_inode_matches(fd, {"ino": info.st_ino}) is True
+        assert core_module._fd_inode_matches(
+            fd, {"dev": info.st_dev + 9999, "ino": info.st_ino}
+        ) is True
     finally:
         os.close(fd)
 

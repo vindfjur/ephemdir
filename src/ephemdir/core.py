@@ -315,28 +315,41 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _inode_matches(path: Path, entry: Entry) -> bool | None:
-    """Compare ``path`` against the entry's stored inode.
+    """Compare ``path`` against the entry's stored inode *number*.
+
+    Only ``st_ino`` is compared, never ``st_dev``. A device number is not
+    stable across reboots — macOS reassigns it for an APFS volume at every boot,
+    and it is not guaranteed stable on Linux either — so comparing it would mark
+    every tracked directory ``foreign`` after a restart and silently defeat
+    restart/expiry cleanup (the directory is never deleted). The on-disk inode
+    number is stable across reboots, and the random ownership marker is the
+    primary proof of ownership; the inode is a secondary cross-check that still
+    distinguishes a replacement created at the same path (which gets a new
+    inode number).
 
     Returns ``True``/``False`` for a definite answer and ``None`` when the
     entry carries no inode information to compare against.
     """
-    dev, ino = entry.get("dev"), entry.get("ino")
-    if not (isinstance(dev, int) and isinstance(ino, int)):
+    ino = entry.get("ino")
+    if not isinstance(ino, int):
         return None
     try:
         path_stat = os.stat(path, follow_symlinks=False)
     except OSError:
         return False
-    return (path_stat.st_dev, path_stat.st_ino) == (dev, ino)
+    return path_stat.st_ino == ino
 
 
 def _fd_inode_matches(fd: int, entry: Entry) -> bool | None:
-    """Compare an already-open directory fd against the entry's stored inode."""
-    dev, ino = entry.get("dev"), entry.get("ino")
-    if not (isinstance(dev, int) and isinstance(ino, int)):
+    """Compare an already-open directory fd against the entry's stored inode number.
+
+    Like :func:`_inode_matches`, only ``st_ino`` is compared so the check is
+    stable across reboots.
+    """
+    ino = entry.get("ino")
+    if not isinstance(ino, int):
         return None
-    fd_stat = os.fstat(fd)
-    return (fd_stat.st_dev, fd_stat.st_ino) == (dev, ino)
+    return os.fstat(fd).st_ino == ino
 
 
 def _is_real_directory(path: Path) -> bool:
@@ -409,7 +422,7 @@ def _staging_ownership(original: Path, staging: Path, entry: Entry) -> str:
     marker. The inode recorded at claim time is a necessary cross-check but
     never sufficient on its own: filesystems such as ext4 and tmpfs reuse an
     inode number the instant the original tree is removed, so a newcomer
-    created at the same private path can inherit the recorded ``(dev, ino)``.
+    created at the same private path can inherit the recorded inode number.
     When the marker is recorded but gone, the result is therefore ambiguous
     (``"unverified"``) and recovery parks it rather than deleting a possible
     replacement.
@@ -1437,6 +1450,86 @@ def resolve(target: str | os.PathLike[str], *, registry: Registry | None = None)
     """
     reg = registry or Registry()
     path, _ = _resolve_active(target, registry=reg)
+    return path
+
+
+# --- Current-directory target resolution -----------------------------------
+#
+# Commands like `keep`, `rm`, `explain` and `extend` can act on the ephemdir
+# directory the user is standing in, with no name argument. We find the nearest
+# `.ephemdir` marker at or above the current directory and act on it only when
+# it matches an active registry entry by marker id and inode -- never guessing.
+
+_CURRENT_NOTFOUND_MESSAGE = (
+    "no target provided and current directory is not inside a tracked ephemdir "
+    "directory; pass a name/path or cd into one"
+)
+_CURRENT_MISMATCH_MESSAGE = (
+    "current directory contains an .ephemdir marker, but it does not match an "
+    "active tracked ephemdir entry; refusing to guess"
+)
+
+
+class _CurrentTargetNotFound(LookupError):
+    """No ``.ephemdir`` marker was found at or above the start directory."""
+
+
+class _CurrentTargetMismatch(LookupError):
+    """A marker was found but does not match an active tracked entry."""
+
+
+def _marker_present(directory: Path) -> bool:
+    """Whether ``directory`` holds an ``.ephemdir`` entry (even a broken link)."""
+    return os.path.lexists(directory / _MARKER_NAME)
+
+
+def _resolve_current_target(
+    *, registry: Registry, start: Path | None = None
+) -> tuple[Path, Entry]:
+    """Resolve the active tracked ephemdir root containing ``start`` (or cwd).
+
+    Walks upward from ``start`` and stops at the **nearest** directory holding
+    an ``.ephemdir`` marker. That directory is returned only when it is an
+    active registry entry whose marker id and inode match (``_ownership`` is
+    ``"ours"``) and whose runtime is compatible. A present-but-unmatched marker
+    raises :class:`_CurrentTargetMismatch` — it never falls through to a marker
+    higher up, and never guesses. No marker anywhere raises
+    :class:`_CurrentTargetNotFound`. The resolver performs no registry
+    mutations.
+    """
+    reg = registry or Registry()
+    try:
+        base = Path.cwd() if start is None else Path(start)
+    except OSError as error:
+        raise _CurrentTargetNotFound(_CURRENT_NOTFOUND_MESSAGE) from error
+    base = _canonical_private_dir_path(base)
+    state = {
+        key: entry
+        for key, entry in reg.load(read_only=True).items()
+        if entry.get("state", "active") == "active"
+    }
+    for directory in (base, *base.parents):
+        if not _marker_present(directory):
+            continue
+        entry = state.get(str(directory))
+        if (
+            entry is not None
+            and _ownership(directory, entry) == "ours"
+            and not _entry_compatibility_blockers(entry)
+        ):
+            return directory, dict(entry)
+        # A marker is here but it does not match an active, owned entry. Refuse
+        # to guess and refuse to walk past it to a marker further up.
+        raise _CurrentTargetMismatch(_CURRENT_MISMATCH_MESSAGE)
+    raise _CurrentTargetNotFound(_CURRENT_NOTFOUND_MESSAGE)
+
+
+def _current_target_path(
+    *, registry: Registry | None = None, start: Path | None = None
+) -> Path:
+    """Return the path of the active ephemdir directory containing the cwd."""
+    reg = registry or Registry()
+    path, _ = _resolve_current_target(registry=reg, start=start)
     return path
 
 

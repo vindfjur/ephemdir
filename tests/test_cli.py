@@ -460,10 +460,10 @@ def test_shell_init_autodetects_known_and_default_shell(capsys, monkeypatch):
 def test_install_and_uninstall_service_cli(capsys, monkeypatch):
     monkeypatch.setattr(
         "ephemdir.cli.install_service",
-        lambda interval: f"installed every {interval}s",
+        lambda interval, runtime_policy: f"installed every {interval}s ({runtime_policy})",
     )
-    assert main(["install-service", "--interval", "7"]) == 0
-    assert "installed every 7s" in capsys.readouterr().err
+    assert main(["install-service", "--interval", "7", "--runtime-policy", "strict"]) == 0
+    assert "installed every 7s (strict)" in capsys.readouterr().err
 
     monkeypatch.setattr("ephemdir.cli.uninstall_service", lambda: "removed")
     assert main(["uninstall-service"]) == 0
@@ -471,7 +471,7 @@ def test_install_and_uninstall_service_cli(capsys, monkeypatch):
 
 
 def test_service_cli_reports_errors(capsys, monkeypatch):
-    def install_failure(interval):
+    def install_failure(interval, runtime_policy):
         raise ValueError("bad interval")
 
     def uninstall_failure():

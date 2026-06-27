@@ -232,25 +232,46 @@ ephemdir uninstall-service
 
 `install-service` validates the persistent runtime before writing anything:
 every component of the interpreter and package paths must be owned by you
-(or root) and must not be writable by other users. This deliberately rejects
-**any** group/world-writable component — including sticky directories like
-`/tmp` — so a virtualenv created under `/tmp` cannot host the scheduled
-service even though it is fine for one-off interactive use. Install the venv
-under your home directory instead. It also checks the interpreter-startup
-hooks Python runs before ephemdir is imported (`.pth` files in site-packages,
-`sitecustomize`, `pyvenv.cfg`, and the `tomli` package on Python 3.10).
+(or root). It always rejects a **world-writable** component (including sticky
+directories like `/tmp`, so a virtualenv under `/tmp` cannot host the scheduled
+service), a **foreign-owned** component, a symlinked package subdirectory, and
+any group/world-writable **executable** file or interpreter-startup hook
+(`.pth` files in site-packages, `sitecustomize`, `pyvenv.cfg`, and the `tomli`
+package on Python 3.10).
 
-On macOS, `install-service` may reject a Homebrew or otherwise shared Python
-runtime if any interpreter/package component is group/world-writable. That is
-expected: launchd will run the interpreter later, so ephemdir refuses a runtime
-another local user could modify after installation. For a dedicated service
-runtime, use a private uv-managed virtual environment under your home directory:
+How strictly it treats a merely **group-writable directory ancestor** is set by
+the runtime policy:
+
+```bash
+ephemdir install-service --interval 600                      # default
+ephemdir install-service --interval 600 --runtime-policy strict
+ephemdir install-service --interval 600 --runtime-policy balanced
+```
+
+* **`balanced`** (the default on macOS) allows a group-writable directory
+  ancestor **only** as a narrow Homebrew/usr-local carve-out, printing a
+  warning. All of these must hold: macOS; the resolved path is under
+  `/opt/homebrew` or `/usr/local`; the directory is owned by root or you; it is
+  not world-writable; and its **owning group is a local administrator group**
+  (`admin`). This is exactly what a stock Homebrew interpreter needs — its
+  `/opt/homebrew/Cellar` ancestor is mode `0775`, group `admin` (the machine's
+  administrators, i.e. the owner on a personal Mac) — which `strict` rejects,
+  silently preventing the scheduled sweep from ever being installed. A
+  group-writable directory whose owning group is an ordinary shared group (which
+  could contain another unprivileged user) is **not** covered and is rejected.
+* **`strict`** (the default off macOS) rejects **any** group-writable component.
+  Use it on a genuinely shared multi-user host.
+
+The default is also overridable with `EPHEMDIR_SERVICE_RUNTIME_POLICY=strict|balanced`.
+If you would rather keep `strict` everywhere, install into a private uv-managed
+virtual environment under your home directory, whose components are owned only
+by you:
 
 ```bash
 uv python install 3.12
 uv venv ~/.venvs/ephemdir-safe --python 3.12
 uv pip install --python ~/.venvs/ephemdir-safe/bin/python ephemdir
-~/.venvs/ephemdir-safe/bin/python -I -m ephemdir install-service
+~/.venvs/ephemdir-safe/bin/python -I -m ephemdir install-service --runtime-policy strict
 ```
 
 > **Trust boundary for `install-service`.** The scheduled job runs your Python
@@ -264,11 +285,22 @@ uv pip install --python ~/.venvs/ephemdir-safe/bin/python ephemdir
 > do; on a shared multi-user host, ensure the environment is owned by you and
 > not group/world-writable before scheduling sweeps.
 
-Prefer to wire it up yourself? The equivalents are:
+Prefer to wire it up yourself? These are **manual alternatives, not equivalents** —
+they are less hardened than `install-service` unless you reproduce all of its
+properties: run the validated interpreter as `python -I -m ephemdir sweep` (not
+a bare `ephemdir` from `PATH`), with working directory `/`, a fixed trusted
+`PATH`, and pinned `EPHEMDIR_DATA_DIR` / `EPHEMDIR_CONFIG_DIR`. `install-service`
+additionally validates the runtime and verifies the isolated import before
+writing anything; a hand-written job does none of that.
 
-* **Linux (cron):** `*/10 * * * * ephemdir sweep`
-* **macOS (launchd):** a `LaunchAgent` running `ephemdir sweep`; template in
+* **Linux (cron):** `*/10 * * * * /path/to/validated/python -I -m ephemdir sweep`
+* **macOS (launchd):** a `LaunchAgent` running the same
+  `/path/to/validated/python -I -m ephemdir sweep`; template in
   [`packaging/`](packaging/).
+
+Set `EPHEMDIR_DATA_DIR`/`EPHEMDIR_CONFIG_DIR` in the job's environment so the
+scheduled sweep cannot drift to a different registry. When in doubt, prefer
+`install-service`.
 
 You can also keep a foreground watcher running:
 
@@ -323,6 +355,28 @@ Every command that takes a directory accepts a full path, the exact name or a
 unique prefix (`bra` or `brave-otter` for `brave-otter-a81f42c9d047315b`).
 Add `-v` for more output or `-q` to
 stay quiet.
+
+### Managing the current directory
+
+If you are inside a directory ephemdir created (or any subdirectory of it), the
+`path`, `explain`, `extend`, `keep` and `rm` commands work with no name:
+
+```bash
+cd "$(ephemdir new --lifetime 2h)"
+ephemdir explain        # describe the current ephemdir directory
+ephemdir extend 30m     # extend the current directory (or --forever)
+ephemdir keep           # keep the current directory; stop tracking it
+ephemdir rm             # delete the current directory's managed root
+```
+
+ephemdir looks for the nearest `.ephemdir` marker at or above your working
+directory and applies the command only when that marker matches an active
+tracked entry. From a subdirectory the target is always the managed **root**,
+not the subdirectory. If the marker is missing, altered or does not match an
+active entry, the command refuses to guess and exits with an error rather than
+falling back to another directory. Outside any tracked directory these commands
+report that there is no target; only `ephemdir path` keeps its old fallback to
+the most recently created directory.
 
 ### Listing with time left
 
