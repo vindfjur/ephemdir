@@ -269,7 +269,9 @@ def test_errors_use_unified_prefix(capsys):
 def test_non_posix_refuses_with_clear_message(capsys, monkeypatch):
     # On Windows/other non-POSIX, refuse with one clear message instead of a
     # confusing OSError or a misleading empty list. `doctor` still runs.
-    monkeypatch.setattr(cli.os, "name", "nt")
+    # Do not mutate the process-wide os.name: argparse/pathlib consult it too
+    # and may try to import Windows-only modules before main reaches the guard.
+    monkeypatch.setattr(cli, "_is_posix_platform", lambda: False)
     for command in (["new"], ["list"], ["sweep"]):
         assert main(command) == 1
         err = capsys.readouterr().err

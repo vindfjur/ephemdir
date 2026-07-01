@@ -92,6 +92,12 @@ from .core import (
 
 logger = logging.getLogger("ephemdir")
 
+
+def _is_posix_platform() -> bool:
+    """Return whether the current platform supports ephemdir operations."""
+    return os.name == "posix"
+
+
 # Status icons for `ephemdir list`, with an ASCII fallback for terminals whose
 # encoding cannot represent emoji (e.g. some Windows consoles).
 _ICONS = {
@@ -1061,7 +1067,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # instead of leaking a confusing OSError from a failed data-dir create or a
     # misleading "no tracked directories". `doctor` still runs so the user can
     # see why.
-    if os.name != "posix" and getattr(args, "command", None) != "doctor":
+    if not _is_posix_platform() and getattr(args, "command", None) != "doctor":
         logger.error(
             "ephemdir: %s: ephemdir is not supported on this platform; it requires "
             "a POSIX system (Linux or macOS). Run `ephemdir doctor` for details.",
