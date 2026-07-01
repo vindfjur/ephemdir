@@ -2,7 +2,7 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/ephemdir.svg)](https://pypi.org/project/ephemdir/)
 [![Python versions](https://img.shields.io/pypi/pyversions/ephemdir.svg)](https://pypi.org/project/ephemdir/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 **ephemdir** (*ephemeral directory*) creates temporary directories that clean
 themselves up — automatically removed once their lifetime expires or after the
@@ -17,17 +17,28 @@ anything on unsupported platforms. The package has no third-party runtime
 dependencies on Python 3.11+; Python 3.10 uses `tomli` only for TOML
 configuration parsing.
 
-v0.5.0 is a POSIX-only hardening release. It adds stricter restart/recovery
-tracking: missing paths are reported and kept tracked until ephemdir verifies
-deletion or you explicitly forget them.
+## Highlights
+
+- **Self-cleaning** — directories vanish after a lifetime (`"2h"`, `"7d"`) or on
+  the next restart, swept lazily and by a schedulable background service.
+- **Safe deletion** — fd-relative, symlink- and mount-aware removal that only
+  touches directories ephemdir can prove it created (marker + inode identity);
+  a replaced or missing directory is reported, never clobbered.
+- **Readable names** — `brave-otter-a81f42c9d047315b`, addressable by any unique
+  prefix, with `ecd` / `enew` shell helpers to jump straight in.
+- **Organise** — tag and describe directories (`--tag`, `--desc`) and filter with
+  `list --tag` / `tree --tag` / `sweep --tag`.
+- **See everything** — `list`, `tree` (with sizes), `explain` (a decision trace)
+  and `stats`, each with a stable `--json` contract and `NO_COLOR`-aware colour.
 
 ## Installation
 
 > [!IMPORTANT]
-> Windows is **not supported in ephemdir 0.5.0**. The package may install on
-> Windows, but `tempdir()` and `ephemdir new` fail before creating anything
-> because Python does not expose the safe handle-bound recursive deletion
-> primitives ephemdir requires. Supported platforms are Linux and macOS.
+> Windows is **not supported**. The package may install on Windows, but
+> `tempdir()` and `ephemdir new` refuse with a clear message before creating
+> anything, because Python does not expose the safe handle-bound recursive
+> deletion primitives ephemdir requires. Supported platforms are Linux and
+> macOS. Run `ephemdir doctor` to see the platform status.
 
 ### macOS (Homebrew)
 
@@ -102,9 +113,12 @@ with tempdir() as scratch:
 | `parent`            | current dir   | Where to create the directory.                                    |
 | `prefix`            | `""`          | Prefix prepended to the generated name.                           |
 | `words`             | `2`           | Number of words in the generated name.                            |
+| `tags`              | `None`        | Labels for grouping/filtering; lowercase `[a-z0-9._-]`, ≤ 32 chars, ≤ 16. |
+| `description`       | `None`        | One-line note (≤ 256 bytes, no control characters).              |
 
 Any option left unset falls back to the [user config file](#configuration), then
-to the built-in default shown above.
+to the built-in default shown above. `tags` and `description` are per-call only
+(not read from config).
 
 ### Managing a directory
 
@@ -336,14 +350,21 @@ handy for sandboxes, tests and dotfile-managed setups.
 ephemdir new                     # create a directory, print its path
 ephemdir new --lifetime 2h       # with a lifetime
 ephemdir new --keep-on-restart   # do not remove on restart
+ephemdir new --tag rust --desc "cargo bench"  # label it for later
 ephemdir list                    # tracked directories, status and time left
+ephemdir list --tag rust         # only directories tagged rust
+ephemdir tree                    # grouped by parent, with sizes
 ephemdir path brave-otter        # print a tracked directory's path
+ephemdir last                    # print the most recently created directory
 ephemdir explain brave-otter     # why a directory is (or isn't) due for cleanup
 ephemdir keep brave-otter        # liked it? stop tracking, keep forever
 ephemdir extend brave-otter 2h   # fresh lifetime from now (--forever: no limit)
 ephemdir rm brave-otter          # remove a tracked directory now
 ephemdir sweep                   # remove everything due now
 ephemdir sweep --force           # remove every tracked directory
+ephemdir sweep --tag build       # only sweep directories tagged build
+ephemdir keep --tag bench        # keep every directory tagged bench
+ephemdir stats                   # lifetime usage counters
 ephemdir prune                   # explicitly forget missing tracked entries
 ephemdir recover brave-otter     # retry an interrupted deletion
 ephemdir recover brave-otter --forget  # forget it without deleting files
@@ -402,6 +423,57 @@ temporarily inaccessible but still tracked. Terminals without emoji support
 fall back to ASCII tags; `--plain` forces them, `--json` prints
 machine-readable output for scripting.
 
+### Sizes, JSON and colour
+
+`ephemdir tree` groups tracked directories by their parent and shows a measured
+size for each (binary units like `12.1 MiB`; a `≥` prefix means the directory was
+too large to measure within the scan budget):
+
+```
+~/work/   1.2 GiB
+  └ 🟢 spotted-armadillo   12.1 MiB
+  └ 🧹 vermilion-mackerel  1.2 GiB
+```
+
+The read-only commands `list`, `tree`, `path`, `last`, `explain` and `doctor`
+accept `--json` for a stable machine-readable contract on stdout (diagnostics go
+to stderr). Colour is controlled by the global `--color {auto,always,never}`
+flag. The default `auto` enables colour only for an interactive terminal and
+disables it when output is piped or when the `NO_COLOR` environment variable is
+set; `--color always` and `--color never` are explicit and override both.
+
+`ephemdir explain <name>` prints a decision trace — the verdict followed by the
+reasons it is due and any blockers holding it back:
+
+```
+$ ephemdir explain spotted-armadillo
+spotted-armadillo: due, but held back
+  ~/work/spotted-armadillo
+  due because:
+    ▸ lifetime has expired (expired)
+  held back because:
+    ✗ files are still open inside it (in-use)
+```
+
+### Tags and descriptions
+
+Label directories at creation to find them later when you have dozens:
+
+```bash
+ephemdir new --tag rust --tag build --desc "cargo benchmark sqlite"
+ephemdir list --tag rust    # only directories carrying every given tag
+ephemdir tree --tag build
+```
+
+Tags and the description show up in `list`, `tree` and `explain` (and in their
+`--json`). Tags are lowercase `a-z 0-9 . _ -`, start with a letter or digit, are
+at most 32 characters, and at most 16 per directory; the description is a single
+line up to 256 bytes.
+
+The stable Python API, CLI, exit codes, JSON shapes and colour rules are
+documented in [CONTRACT.md](CONTRACT.md); the on-disk registry schema and how it
+is migrated are in [MIGRATION.md](MIGRATION.md).
+
 ### Jumping into directories (`ecd` / `enew`)
 
 A subprocess cannot change your shell's working directory, so ephemdir ships
@@ -453,4 +525,4 @@ verifies them again after the install smoke test.
 
 ## License
 
-MIT © vindfjur
+[Apache License 2.0](LICENSE) © vindfjur. See [NOTICE](NOTICE) for attribution.

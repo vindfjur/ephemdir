@@ -12,6 +12,7 @@ from pathlib import Path
 from ._platform import boot_session_id, boot_time, user_config_dir, user_data_dir
 from ._registry import (
     _MAX_REGISTRY_BYTES,
+    _REGISTRY_SCHEMA_VERSION,
     Registry,
     RegistryFormatError,
     RegistryTooLargeError,
@@ -66,7 +67,7 @@ def run_doctor(*, registry: Registry | None = None) -> list[DoctorCheck]:
     )
     checks.append(_directory_check("data-dir", data_dir))
     checks.append(_directory_check("config-dir", config_dir))
-    checks.append(_registry_check(reg))
+    checks.extend(_registry_checks(reg))
     boot_id = boot_session_id()
     checks.append(
         DoctorCheck(
@@ -161,22 +162,44 @@ def _directory_chain_problem(path: Path) -> str | None:
     return None
 
 
-def _registry_check(registry: Registry) -> DoctorCheck:
+def _registry_checks(registry: Registry) -> list[DoctorCheck]:
     try:
-        count = _diagnose_registry(registry.path)
+        count, schema = _diagnose_registry(registry.path)
     except FileNotFoundError:
-        return DoctorCheck("registry", True, f"{registry.path} is not created yet")
+        return [DoctorCheck("registry", True, f"{registry.path} is not created yet")]
     except RegistryTooLargeError as error:
-        return DoctorCheck("registry", False, str(error), "Inspect or rotate the registry.")
+        return [DoctorCheck("registry", False, str(error), "Inspect or rotate the registry.")]
     except (RegistryFormatError, UnsafeRegistryError, RegistryUnavailableError) as error:
-        return DoctorCheck("registry", False, str(error), "Inspect registry contents and trust.")
+        return [DoctorCheck("registry", False, str(error), "Inspect registry contents and trust.")]
     except (OSError, UnicodeDecodeError, ValueError) as error:
-        return DoctorCheck("registry", False, str(error), "Inspect or repair the registry JSON.")
-    return DoctorCheck("registry", True, f"{count} tracked entrie(s)")
+        return [DoctorCheck("registry", False, str(error), "Inspect or repair the registry JSON.")]
+    return [
+        DoctorCheck("registry", True, f"{count} tracked entrie(s)"),
+        _schema_check(schema),
+    ]
 
 
-def _diagnose_registry(path: Path) -> int:
-    """Read registry bytes without mutating, quarantining, or following symlinks."""
+def _schema_check(schema: int | None) -> DoctorCheck:
+    """Report the on-disk registry schema and any pending forward migration."""
+    current = _REGISTRY_SCHEMA_VERSION
+    on_disk = "v1 (flat)" if schema is None else f"v{schema}"
+    needs_migration = schema is None or schema < current
+    if not needs_migration:
+        return DoctorCheck("registry-schema", True, f"schema {on_disk}")
+    return DoctorCheck(
+        "registry-schema",
+        True,
+        f"schema {on_disk}; will migrate to v{current} on next change",
+        f"A timestamped backup is kept beside the registry when it migrates to v{current}.",
+    )
+
+
+def _diagnose_registry(path: Path) -> tuple[int, int | None]:
+    """Read registry bytes without mutating, quarantining, or following symlinks.
+
+    Returns the entry count and the on-disk schema version (``None`` for a flat
+    pre-envelope v1 registry).
+    """
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     fd = _open_nofollow(path, flags)
     with os.fdopen(fd, "rb") as handle:
@@ -196,6 +219,7 @@ def _diagnose_registry(path: Path) -> int:
         raise RegistryTooLargeError("registry file is larger than 1 MiB")
     data = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
     entries = _extract_entries(data)
+    schema = data.get("schema_version") if isinstance(data, dict) else None
     malformed = [
         key
         for key, entry in entries.items()
@@ -203,4 +227,4 @@ def _diagnose_registry(path: Path) -> int:
     ]
     if malformed:
         raise RegistryFormatError("registry contains malformed entries")
-    return len(entries)
+    return len(entries), schema

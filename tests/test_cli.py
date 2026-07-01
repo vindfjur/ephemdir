@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from ephemdir import cli
 from ephemdir._doctor import DoctorCheck
 from ephemdir._menu import run_menu
 from ephemdir._registry import (
@@ -115,6 +116,8 @@ def test_list_json(capsys, tmp_path):
     entry = next(item for item in payload if item["path"] == created)
     assert entry["status"] == "active"
     assert 0 < entry["remaining_seconds"] <= 3600
+    # Durations are integer seconds in the JSON contract (RC4-1), matching explain.
+    assert isinstance(entry["remaining_seconds"], int)
     assert entry["remove_on_restart"] is True
 
 
@@ -126,6 +129,152 @@ def test_list_json_empty(capsys):
 def test_list_empty_plain_warns(capsys):
     assert main(["list", "--plain"]) == 0
     assert "no tracked directories" in capsys.readouterr().err
+
+
+def test_tree_groups_by_parent(capsys, tmp_path):
+    a = _create(capsys, tmp_path, "--lifetime", "1h")
+    b = _create(capsys, tmp_path, "--lifetime", "1h")
+    assert main(["tree", "--plain"]) == 0
+    out = capsys.readouterr().out
+    assert f"{tmp_path}/" in out
+    assert Path(a).name in out and Path(b).name in out
+
+
+def test_tree_json_contract(capsys, tmp_path):
+    created = _create(capsys, tmp_path, "--lifetime", "1h")
+    assert main(["tree", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    row = next(item for item in payload if item["path"] == created)
+    assert row["parent"] == str(tmp_path)
+    assert row["status"] == "active"
+    assert isinstance(row["size_complete"], bool)
+    assert "size_bytes" in row
+
+
+def test_tree_empty_warns(capsys):
+    assert main(["tree"]) == 0
+    assert "no tracked directories" in capsys.readouterr().err
+
+
+def test_tree_does_not_measure_replaced_directory(capsys, tmp_path):
+    # RC3-1: a replaced (markerless) directory is shown but never fd-walked.
+    created = _create(capsys, tmp_path)
+    shutil.rmtree(created)
+    Path(created).mkdir()
+    (Path(created) / "foreign.bin").write_bytes(b"x" * 5000)
+    assert main(["tree", "--json"]) == 0
+    row = next(item for item in json.loads(capsys.readouterr().out)
+               if item["path"] == created)
+    assert row["status"] == "replaced"
+    assert row["size_bytes"] is None
+    assert row["size_complete"] is True
+
+
+def test_doctor_escapes_control_characters(capsys, tmp_path, monkeypatch):
+    # RC3-2: doctor must escape control chars in messages/hints, like the
+    # other commands in the unified output layer.
+    evil = str(tmp_path / "evil\n\x1b[31mRED\x07")
+    monkeypatch.setenv("EPHEMDIR_DATA_DIR", evil)
+    assert main(["doctor"]) in {0, 1}
+    out = capsys.readouterr().out
+    assert "\x1b[31m" not in out
+    assert "\x07" not in out
+    assert "\\x1b" in out  # escaped form is present instead
+
+
+def test_tree_subtotal_unknown_when_all_children_unmeasured(capsys, tmp_path):
+    # RC4-2: a parent whose only child is non-owned must not claim "0 B".
+    created = _create(capsys, tmp_path)
+    shutil.rmtree(created)
+    Path(created).mkdir()  # replaced -> unmeasured
+    assert main(["tree", "--plain"]) == 0
+    out = capsys.readouterr().out
+    parent_line = next(line for line in out.splitlines()
+                       if line.startswith(f"{tmp_path}/"))
+    assert "0 B" not in parent_line
+    assert "?" in parent_line
+
+
+def test_tree_subtotal_is_lower_bound_when_some_unmeasured(capsys, tmp_path):
+    good = _create(capsys, tmp_path, "--lifetime", "1h")
+    (Path(good) / "f.bin").write_bytes(b"x" * 5000)
+    bad = _create(capsys, tmp_path)
+    shutil.rmtree(bad)
+    Path(bad).mkdir()
+    assert main(["tree", "--plain"]) == 0
+    out = capsys.readouterr().out
+    parent_line = next(line for line in out.splitlines()
+                       if line.startswith(f"{tmp_path}/"))
+    assert "≥" in parent_line  # ≥ : measured subtotal is a lower bound
+
+
+def test_new_rejects_formatting_chars_in_prefix(capsys, tmp_path):
+    # RC4-3: bidi/format characters (U+202E RIGHT-TO-LEFT OVERRIDE) are rejected
+    # in a name prefix. Built with chr() to keep the source ASCII-only.
+    rlo = chr(0x202E)
+    assert main(["new", "-p", str(tmp_path), "--prefix", f"a{rlo}b"]) == 2
+    assert "control or formatting" in capsys.readouterr().err
+
+
+def test_extend_forever_with_lifetime_uses_unified_error(capsys, tmp_path):
+    # RC3-3: this usage error went through the bare logger, not _fail.
+    _create(capsys, tmp_path)
+    assert main(["extend", "--forever", "2h"]) == 2
+    err = capsys.readouterr().err
+    assert "ephemdir: extend:" in err
+    assert "--forever cannot be combined with a lifetime" in err
+
+
+def test_last_returns_most_recent(capsys, tmp_path):
+    _create(capsys, tmp_path)
+    latest = _create(capsys, tmp_path)
+    assert main(["last"]) == 0
+    assert capsys.readouterr().out.strip() == latest
+
+
+def test_last_json(capsys, tmp_path):
+    latest = _create(capsys, tmp_path)
+    assert main(["last", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"path": latest, "name": Path(latest).name}
+
+
+def test_last_without_directories_fails(capsys):
+    assert main(["last"]) == 1
+    assert "no tracked directories" in capsys.readouterr().err
+
+
+def test_path_json(capsys, tmp_path):
+    created = _create(capsys, tmp_path)
+    assert main(["path", Path(created).name, "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"path": created, "name": Path(created).name}
+
+
+def test_color_never_and_always(capsys, tmp_path):
+    _create(capsys, tmp_path, "--lifetime", "1h")
+    assert main(["--color", "never", "list"]) == 0
+    assert "\x1b[" not in capsys.readouterr().out
+    assert main(["--color", "always", "list"]) == 0
+    assert "\x1b[" in capsys.readouterr().out
+
+
+def test_errors_use_unified_prefix(capsys):
+    assert main(["path", "no-such-dir"]) == 1
+    err = capsys.readouterr().err
+    assert "ephemdir: path:" in err
+    assert "no tracked directory" in err
+
+
+def test_non_posix_refuses_with_clear_message(capsys, monkeypatch):
+    # On Windows/other non-POSIX, refuse with one clear message instead of a
+    # confusing OSError or a misleading empty list. `doctor` still runs.
+    monkeypatch.setattr(cli.os, "name", "nt")
+    for command in (["new"], ["list"], ["sweep"]):
+        assert main(command) == 1
+        err = capsys.readouterr().err
+        assert "not supported on this platform" in err
+        assert "POSIX" in err
 
 
 def test_path_resolves_by_name(capsys, tmp_path):
@@ -290,7 +439,19 @@ def test_explain_reports_reasons(capsys, tmp_path):
     created = _create(capsys, tmp_path, "--until-sweep")
     assert main(["explain", Path(created).name]) == 0
     out = capsys.readouterr().out
-    assert "reasons=next-sweep" in out
+    # The decision trace names the triggering reason (next-sweep) and the dir.
+    assert "next-sweep" in out
+    assert "due because" in out
+
+
+def test_explain_json_contract(capsys, tmp_path):
+    created = _create(capsys, tmp_path, "--until-sweep")
+    assert main(["explain", Path(created).name, "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["name"] == Path(created).name
+    assert payload["status"] in {"due", "active", "blocked"}
+    assert "next-sweep" in payload["reasons"]
+    assert any(check["check"] == "next-sweep" for check in payload["decision"])
 
 
 def test_explain_unknown_target_fails(capsys):

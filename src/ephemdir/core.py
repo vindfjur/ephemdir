@@ -11,8 +11,9 @@ import re
 import stat
 import sys
 import time
+import unicodedata
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -44,7 +45,14 @@ from ._platform import (
     user_data_dir,
 )
 from ._policy import CleanupDecision, CleanupPolicy, SweepMode, decide_cleanup
-from ._registry import Entry, Registry
+from ._registry import (
+    _MAX_DESCRIPTION_BYTES,
+    _MAX_TAGS_PER_ENTRY,
+    Entry,
+    Registry,
+    _has_control_character,
+    _valid_tag,
+)
 from ._security import (
     open_or_create_trusted_directory as _security_open_or_create_trusted_directory,
 )
@@ -61,6 +69,7 @@ from ._security import (
     walk_trusted_directory as _security_walk_trusted_directory,
 )
 from ._size import measure_tree, parse_size
+from ._stats import StatsLedger
 
 __all__ = [
     "EphemeralDirectory",
@@ -760,6 +769,8 @@ def tempdir(
     parent: str | os.PathLike[str] | None = _UNSET,  # type: ignore[assignment]
     prefix: str = _UNSET,  # type: ignore[assignment]
     words: int = _UNSET,  # type: ignore[assignment]
+    tags: Sequence[str] | None = None,
+    description: str | None = None,
     registry: Registry | None = None,
 ) -> EphemeralDirectory:
     """Create and register a new ephemeral directory.
@@ -802,6 +813,13 @@ def tempdir(
         Optional prefix prepended to the generated playful name.
     words:
         Number of words in the generated name (``2`` -> ``brave-otter``).
+    tags:
+        Optional labels for grouping and filtering (e.g. ``["rust", "build"]``).
+        Each tag is lowercase, starts with a letter or digit, uses only
+        ``a-z 0-9 . _ -`` and is at most 32 characters; at most 16 per directory.
+    description:
+        Optional one-line, human-readable note (≤ 256 bytes, no control
+        characters) shown in ``list`` and ``explain``.
     registry:
         Custom :class:`Registry` (mainly for testing).
 
@@ -867,7 +885,15 @@ def tempdir(
         raise TypeError("prefix must be a string")
     _validate_prefix(settings["prefix"])
     _validate_words(settings["words"])
+    tags_value = _normalize_tags(tags)
+    description_value = _normalize_description(description)
     parent_path = _normalize_parent_value(settings["parent"])
+    # Reject a parent whose path carries control/format/surrogate characters
+    # before any side effect (preflight, lazy sweep, or directory creation), so
+    # an unstorable registry key can never leave an unregistered directory
+    # behind on disk (RC7-1). The registry would refuse such a key on save.
+    if _has_control_character(str(parent_path)):
+        raise ValueError("parent path must not contain control or formatting characters")
 
     backend_error = _safe_delete_backend_error()
     if backend_error is not None:
@@ -935,7 +961,7 @@ def tempdir(
                     "cleanup_policy": cleanup_policy.value,
                     "max_size": max_size_bytes,
                     "name_style": effective_name_style,
-                    "registry_version": 2,
+                    "registry_version": 3,
                     "backend": "posix" if os.name == "posix" else sys.platform,
                     "platform": sys.platform,
                     "boot_time": created_boot_time,
@@ -948,6 +974,12 @@ def tempdir(
                 if path_stat.st_ino:  # 0 means the filesystem does not report inodes
                     entry["dev"] = path_stat.st_dev
                     entry["ino"] = path_stat.st_ino
+                # Only store the optional v3 metadata when set, so an untagged
+                # directory's entry stays byte-identical to earlier versions.
+                if tags_value:
+                    entry["tags"] = tags_value
+                if description_value is not None:
+                    entry["description"] = description_value
                 if str(path) in state:
                     # Defensive assertion against future refactors that weaken the
                     # reservation check. Never overwrite a deletion journal.
@@ -972,6 +1004,7 @@ def tempdir(
     if path is None or marker_id is None:
         raise RuntimeError("internal error: directory registration produced no path or marker")
     logger.info("created ephemeral directory %s", path)
+    _record_stats(created=1)
     return EphemeralDirectory(
         path,
         created_at=now,
@@ -1093,20 +1126,26 @@ def sweep(
     force: bool = False,
     dry_run: bool = False,
     mode: SweepMode | str | None = None,
+    tags: Sequence[str] | None = None,
 ) -> int:
     """Remove every tracked directory that is due for cleanup.
 
     Interrupted journal entries are reconciled under the same per-directory
     OS lock used by claim/delete.  This prevents a live claim from being
     mistaken for a crashed one by a concurrent sweep.
+
+    ``tags`` restricts the sweep to directories carrying every given tag. It can
+    only *narrow* the candidate set — it never changes which directories are due
+    or how they are deleted — so it is safe with respect to the deletion path.
     """
     reg = registry or Registry()
+    wanted = _normalize_tags(tags)
     sweep_mode = SweepMode.FORCE if force else (SweepMode(mode) if mode else SweepMode.FULL)
     is_force = sweep_mode is SweepMode.FORCE
     if dry_run:
         return sum(
             1
-            for decision in plan_sweep(registry=reg, force=is_force, mode=sweep_mode)
+            for decision in plan_sweep(registry=reg, force=is_force, mode=sweep_mode, tags=wanted)
             if decision.destructive_allowed
         )
     now = time.time()
@@ -1122,6 +1161,8 @@ def sweep(
         for key in list(state.keys()):
             entry = state[key]
             path = Path(key)
+            if wanted and not _entry_has_tags(entry, wanted):
+                continue  # tag filter only narrows; never touches non-matching entries
             blockers = _entry_compatibility_blockers(entry)
             if blockers:
                 logger.warning("deferring incompatible entry for %s: %s", path, ", ".join(blockers))
@@ -1257,6 +1298,8 @@ def sweep(
                     path,
                 )
 
+    if removed:
+        _record_stats(swept=removed)
     return removed
 
 
@@ -1265,9 +1308,14 @@ def plan_sweep(
     registry: Registry | None = None,
     force: bool = False,
     mode: SweepMode | str | None = None,
+    tags: Sequence[str] | None = None,
 ) -> list[CleanupDecision]:
-    """Return the read-only cleanup plan for the current registry."""
+    """Return the read-only cleanup plan for the current registry.
+
+    ``tags`` narrows the plan to directories carrying every given tag.
+    """
     reg = registry or Registry()
+    wanted = _normalize_tags(tags)
     sweep_mode = SweepMode.FORCE if force else (SweepMode(mode) if mode else SweepMode.FULL)
     now = time.time()
     current_boot = boot_time()
@@ -1275,6 +1323,8 @@ def plan_sweep(
     decisions: list[CleanupDecision] = []
     for key, entry in reg.load(read_only=True).items():
         path = Path(key)
+        if wanted and not _entry_has_tags(entry, wanted):
+            continue
         if entry.get("state", "active") != "active":
             decisions.append(_recovery_plan_decision(path, entry))
             continue
@@ -1573,6 +1623,7 @@ def keep(target: str | os.PathLike[str], *, registry: Registry | None = None) ->
         # may contain the user's own .ephemdir file, a legacy one never had any.
         _remove_marker_if_ours(path, entry.get("marker_id"))
         logger.info("kept %s (no longer tracked)", path)
+        _record_stats(kept=1)
     else:
         logger.info("forgot missing tracked directory: %s", path)
     return path
@@ -1616,6 +1667,7 @@ def remove(target: str | os.PathLike[str], *, registry: Registry | None = None) 
     path, snapshot = _resolve_active(target, registry=reg)
     _execute_remove(path, reg, expected=snapshot)
     logger.info("removed %s", path)
+    _record_stats(removed=1)
     return path
 
 
@@ -1926,14 +1978,63 @@ def _validate_prefix(prefix: str) -> None:
             f"prefix {prefix!r} must not contain path separators; the directory "
             "is always created directly under parent"
         )
-    if any(ord(char) < 32 or ord(char) == 127 for char in prefix):
-        raise ValueError("prefix must not contain control characters")
+    if any(
+        ord(char) < 32 or ord(char) == 127
+        or unicodedata.category(char) in ("Cc", "Cf", "Cs")
+        for char in prefix
+    ):
+        raise ValueError("prefix must not contain control or formatting characters")
 
 
 def _validate_words(words: object) -> None:
     """Reject word counts outside what name generation supports (1-4)."""
     if not isinstance(words, int) or isinstance(words, bool) or not 1 <= words <= 4:
         raise ValueError("words must be an integer between 1 and 4")
+
+
+def _record_stats(**deltas: int) -> None:
+    """Best-effort lifetime-counter update; never raises into the caller."""
+    StatsLedger().record(**deltas)
+
+
+def _entry_has_tags(entry: Entry, wanted: Sequence[str]) -> bool:
+    """True when ``entry`` carries every tag in ``wanted`` (AND semantics)."""
+    raw = entry.get("tags")
+    have = {tag for tag in raw if isinstance(tag, str)} if isinstance(raw, list) else set()
+    return all(tag in have for tag in wanted)
+
+
+def _normalize_tags(tags: Sequence[str] | None) -> list[str]:
+    """Validate user-supplied tags, preserving order and dropping duplicates."""
+    if tags is None:
+        return []
+    if isinstance(tags, str):
+        raise TypeError("tags must be a sequence of strings, not a single string")
+    normalized: list[str] = []
+    for tag in tags:
+        if not _valid_tag(tag):
+            raise ValueError(
+                f"invalid tag {tag!r}: tags are lowercase, start with a letter or "
+                "digit, use only a-z 0-9 . _ -, and are at most 32 characters"
+            )
+        if tag not in normalized:
+            normalized.append(tag)
+    if len(normalized) > _MAX_TAGS_PER_ENTRY:
+        raise ValueError(f"at most {_MAX_TAGS_PER_ENTRY} tags are allowed per directory")
+    return normalized
+
+
+def _normalize_description(description: str | None) -> str | None:
+    """Validate a user-supplied description (short, single-line, no controls)."""
+    if description is None:
+        return None
+    if not isinstance(description, str):
+        raise TypeError("description must be a string or None")
+    if len(description.encode("utf-8", errors="surrogatepass")) > _MAX_DESCRIPTION_BYTES:
+        raise ValueError(f"description must be at most {_MAX_DESCRIPTION_BYTES} bytes")
+    if _has_control_character(description):
+        raise ValueError("description must not contain control or formatting characters")
+    return description
 
 
 def _create_unique_dir(
@@ -2047,15 +2148,18 @@ def _open_verified_staging(staging: Path, entry: Entry) -> int:
         marker_id = entry.get("marker_id")
         marker = _read_marker_at(fd)
         if isinstance(marker_id, str):
-            if marker is not None and marker != marker_id:
+            # The recorded marker is the primary proof of ownership; a matching
+            # inode alone is never sufficient because inode numbers are reused
+            # the instant a tree is removed. So when a marker id is on record the
+            # marker must still be present AND match — mirroring the claim-time
+            # preflight and _staging_ownership, which already treat a missing
+            # marker as unproven. Accepting inode-only here would let a same-user
+            # race swap the staging path for a marker-less replacement that
+            # happened to inherit the recorded inode.
+            if marker != marker_id:
                 raise _StagingIdentityError(
                     errno.ESTALE,
                     f"{staging} no longer carries ephemdir's ownership marker",
-                )
-            if marker is None and inode_ok is None:
-                raise _StagingIdentityError(
-                    errno.ESTALE,
-                    f"{staging} cannot be verified without marker or inode",
                 )
         elif inode_ok is None:
             raise _StagingIdentityError(
@@ -2249,7 +2353,21 @@ def _delete_directory_contents_fd(
 
 
 def _rmdir_verified_staging(staging: Path, staging_fd: int) -> None:
-    """Remove the empty staging directory if the pathname still names ``staging_fd``."""
+    """Remove the empty staging directory if the pathname still names ``staging_fd``.
+
+    By this point the owned staging tree's contents have already been removed
+    through the fd-bound path, so only an empty directory remains to unlink.
+    There is no portable fd-only ``rmdir`` primitive, so the final removal is
+    necessarily by pathname and carries an accepted same-user TOCTOU window:
+    between the identity ``stat`` below and ``os.rmdir`` a racing same-user
+    process could swap an *empty* replacement (with the reused inode) into the
+    path. The risk envelope is deliberately bounded — ``rmdir`` refuses a
+    non-empty directory, a symlink, or a mountpoint, so any replacement that
+    actually holds data survives; only an empty directory the racer itself
+    created could be removed, which is not a privilege-boundary break. This
+    residual race is documented in SECURITY.md and pinned by
+    ``test_empty_staging_rmdir_cannot_remove_nonempty_replacement``.
+    """
     fd_stat = os.fstat(staging_fd)
     try:
         live_stat = os.stat(staging, follow_symlinks=False)

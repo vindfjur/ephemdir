@@ -30,6 +30,7 @@ import os
 import stat
 import sys
 import time
+import unicodedata
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -84,12 +85,23 @@ Entry = dict[str, object]
 _LOCK_TIMEOUT_SECONDS = 10.0
 _LOCK_POLL_SECONDS = 0.05
 _MAX_REGISTRY_BYTES = 1_048_576
-_REGISTRY_SCHEMA_VERSION = 2
+_REGISTRY_SCHEMA_VERSION = 3
+# Oldest on-disk envelope this ephemdir can read and migrate forward. A flat v1
+# registry has no ``schema_version`` key at all and is handled separately.
+_MIN_SUPPORTED_SCHEMA_VERSION = 2
 _MAX_REGISTRY_ENTRIES = 10_000
 _MAX_ENTRY_BYTES = 8_192
 _MAX_PATH_BYTES = 4_096
 _MAX_STRING_BYTES = 4_096
 _MAX_LAST_ERROR_BYTES = 1_024
+
+# User-supplied labels (schema v3). Both are untrusted input and are validated
+# as strictly as every other registry field.
+_MAX_TAGS_PER_ENTRY = 16
+_MAX_TAG_CHARS = 32
+_MAX_DESCRIPTION_BYTES = 256
+_TAG_ALLOWED_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789._-")
+_TAG_ALLOWED_START = frozenset("abcdefghijklmnopqrstuvwxyz0123456789")
 
 # Expected types for known entry fields; anything violating these marks the
 # whole entry as invalid (a poisoned entry must never reach the sweeper).
@@ -114,6 +126,8 @@ _FIELD_TYPES: dict[str, tuple[type, ...]] = {
     "name_style": (str,),
     "backend": (str,),
     "platform": (str,),
+    "tags": (list,),
+    "description": (str, type(None)),
 }
 
 # Numeric fields must be finite: JSON like ``1e999`` parses to infinity and
@@ -330,6 +344,16 @@ def _valid_entry(key: str, entry: object) -> bool:
             return False
         if field == "name_style" and value not in _VALID_NAME_STYLES:
             return False
+        if field == "tags" and isinstance(value, list):
+            if len(value) > _MAX_TAGS_PER_ENTRY:
+                return False
+            if not all(_valid_tag(tag) for tag in value):
+                return False
+        if field == "description" and isinstance(value, str):
+            if len(value.encode("utf-8", errors="surrogatepass")) > _MAX_DESCRIPTION_BYTES:
+                return False
+            if _has_control_character(value):
+                return False
     state = entry.get("state", "active")
     if state not in _VALID_STATES:
         return False
@@ -366,7 +390,31 @@ def _valid_hex_id(value: object) -> bool:
 
 
 def _has_control_character(value: str) -> bool:
-    return any(ord(char) < 32 or ord(char) == 127 for char in value)
+    """True if ``value`` has any C0/DEL, C1, Unicode format (Cf) or surrogate (Cs).
+
+    Covers ASCII controls plus Unicode control/format characters such as
+    U+202E RIGHT-TO-LEFT OVERRIDE and zero-width joiners, and surrogate code
+    points (U+D800-U+DFFF) — the form raw undecodable bytes take under POSIX
+    ``surrogateescape``, which would otherwise round-trip back to the original
+    control byte on output. Matches the prefix and separator validators so
+    stored fields are as strict as generated names.
+    """
+    return any(
+        ord(char) < 32 or ord(char) == 127
+        or unicodedata.category(char) in ("Cc", "Cf", "Cs")
+        for char in value
+    )
+
+
+def _valid_tag(value: object) -> bool:
+    """A tag is a short, lowercase, filesystem- and shell-safe label."""
+    if not isinstance(value, str):
+        return False
+    if not 1 <= len(value) <= _MAX_TAG_CHARS:
+        return False
+    if value[0] not in _TAG_ALLOWED_START:
+        return False
+    return all(char in _TAG_ALLOWED_CHARS for char in value)
 
 
 def _valid_registry_path(value: object) -> bool:
@@ -399,14 +447,19 @@ def _registry_envelope(state: dict[str, Entry]) -> dict[str, object]:
         "schema_version": _REGISTRY_SCHEMA_VERSION,
         "writer": {
             "name": "ephemdir",
-            "format": "registry-v2",
+            "format": f"registry-v{_REGISTRY_SCHEMA_VERSION}",
         },
         "entries": state,
     }
 
 
 def _extract_entries(data: object) -> dict[str, object]:
-    """Extract the entries mapping from v1 flat data or v2 envelope data."""
+    """Extract the entries mapping from a flat v1, or a v2/v3 envelope.
+
+    v2 and v3 share the same envelope and entries shape; v3 only adds the
+    optional ``tags``/``description`` fields, so a v2 file reads cleanly and is
+    migrated forward on the next save.
+    """
     if not isinstance(data, dict):
         raise ValueError("registry top level must be an object")
     schema = data.get("schema_version")
@@ -418,11 +471,11 @@ def _extract_entries(data: object) -> dict[str, object]:
         raise RegistryFormatError(
             f"registry schema {schema} is newer than this ephemdir supports"
         )
-    if schema != _REGISTRY_SCHEMA_VERSION:
+    if schema < _MIN_SUPPORTED_SCHEMA_VERSION:
         raise RegistryFormatError(f"unsupported registry schema {schema}")
     entries = data.get("entries")
     if not isinstance(entries, dict):
-        raise ValueError("registry v2 entries must be an object")
+        raise ValueError("registry entries must be an object")
     return entries
 
 
@@ -455,7 +508,9 @@ class Registry:
         self._lock_path = self.path.with_suffix(self.path.suffix + ".lock")
         self._name = _safe_child_name(self.path)
         self._lock_name = _safe_child_name(self._lock_path)
-        self._legacy_backup_needed = False
+        # Set to the on-disk format label ("v1"/"v2") when a load under the lock
+        # sees an older schema, so the next save backs it up before migrating.
+        self._pending_backup_label: str | None = None
 
     def _open_state_dir(self, *, create: bool) -> int:
         """Open the state directory that owns registry support files."""
@@ -556,10 +611,15 @@ class Registry:
                     f"registry {self.path} is corrupt: {error}"
                 ) from error
 
-            legacy_format = False
+            backup_label: str | None = None
             try:
                 entries = _extract_entries(data)
-                legacy_format = isinstance(data, dict) and data.get("schema_version") is None
+                if isinstance(data, dict):
+                    on_disk_schema = data.get("schema_version")
+                    if on_disk_schema is None:
+                        backup_label = "v1"
+                    elif on_disk_schema < _REGISTRY_SCHEMA_VERSION:
+                        backup_label = f"v{on_disk_schema}"
             except RegistryFormatError as error:
                 logger.warning("could not safely use registry %s: %s", self.path, error)
                 raise
@@ -586,8 +646,8 @@ class Registry:
                         f"registry {self.path} is corrupt: {reason}"
                     ) from reason
                 valid[key] = dict(entry)
-            if _locked and legacy_format:
-                self._legacy_backup_needed = True
+            if _locked and backup_label is not None:
+                self._pending_backup_label = backup_label
             return valid
         finally:
             if close_dir_fd and _dir_fd is not None:
@@ -657,8 +717,8 @@ class Registry:
         tmp_name_value, fd = _open_random_temp_at(_dir_fd, self._name)
         tmp_name: str | None = tmp_name_value
         try:
-            if self._legacy_backup_needed:
-                self._write_legacy_backup(_dir_fd)
+            if self._pending_backup_label is not None:
+                self._write_format_backup(_dir_fd, self._pending_backup_label)
             with os.fdopen(fd, "wb") as handle:
                 handle.write(payload)
                 handle.flush()
@@ -674,10 +734,15 @@ class Registry:
                     pass
             if close_dir_fd and _dir_fd is not None:
                 os.close(_dir_fd)
-            self._legacy_backup_needed = False
+            self._pending_backup_label = None
 
-    def _write_legacy_backup(self, dir_fd: int) -> None:
-        """Create an owner-only backup before migrating flat v1 registry data."""
+    def _write_format_backup(self, dir_fd: int, label: str) -> None:
+        """Copy the current registry aside before migrating it to a newer schema.
+
+        ``label`` is the on-disk format being superseded ("v1", "v2", ...). The
+        backup is owner-only and is created without ever replacing an existing
+        backup, so a migration can never silently overwrite an earlier one.
+        """
         try:
             source_fd = _open_nofollow_at(
                 dir_fd,
@@ -689,7 +754,7 @@ class Registry:
         backup_name: str | None = None
         try:
             with os.fdopen(source_fd, "rb") as source:
-                backup, backup_fd = self._open_legacy_backup_destination(dir_fd)
+                backup, backup_fd = self._open_format_backup_destination(dir_fd, label)
                 backup_name = backup
                 with os.fdopen(backup_fd, "wb") as target:
                     while True:
@@ -708,17 +773,17 @@ class Registry:
                 except OSError:
                     pass
 
-    def _open_legacy_backup_destination(self, dir_fd: int) -> tuple[str, int]:
+    def _open_format_backup_destination(self, dir_fd: int, label: str) -> tuple[str, int]:
         """Create a new backup file without replacing an existing backup."""
         flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-        primary = f"{self._name}.v1.bak"
+        primary = f"{self._name}.{label}.bak"
         try:
             return primary, _open_owner_file_at(dir_fd, primary, flags)
         except FileExistsError:
             pass
         for _ in range(_TEMP_OPEN_ATTEMPTS):
             suffix = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
-            backup = f"{self._name}.v1.{suffix}.bak"
+            backup = f"{self._name}.{label}.{suffix}.bak"
             try:
                 return backup, _open_owner_file_at(dir_fd, backup, flags)
             except FileExistsError:

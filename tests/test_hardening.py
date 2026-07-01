@@ -814,6 +814,52 @@ def test_copied_marker_cannot_override_staging_inode_mismatch(tmp_path, registry
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX dir_fd deletion semantics")
+def test_verified_staging_requires_marker_when_marker_id_recorded(tmp_path):
+    # A staging directory whose inode matches the recorded one but which carries
+    # no ownership marker must NOT be deleted when a marker id is on record:
+    # inode numbers are reused, so inode-only proof would let a marker-less
+    # replacement be destroyed. The final fd-bound check must fail closed.
+    staging = tmp_path / ".victim.123-abcdef12.deleting"
+    staging.mkdir()
+    (staging / "innocent.txt").write_text("foreign", encoding="utf-8")
+    st = staging.stat()
+    entry = {"marker_id": "0" * 32, "ino": st.st_ino, "dev": st.st_dev}
+
+    with pytest.raises(core._StagingIdentityError):
+        core._delete_staging_tree(staging, entry)
+
+    assert (staging / "innocent.txt").read_text(encoding="utf-8") == "foreign"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX dir_fd deletion semantics")
+def test_empty_staging_rmdir_cannot_remove_nonempty_replacement(tmp_path, monkeypatch):
+    # RC2-2 risk envelope. The final unlink of the (now empty) staging directory
+    # is necessarily by pathname and has an accepted same-user TOCTOU window. We
+    # pin the boundary that actually matters: even if the identity stat is fooled
+    # (simulating inode reuse), a NON-EMPTY replacement at the staging path must
+    # survive, because rmdir refuses a non-empty directory. The empty-replacement
+    # race is documented as known/accepted, not prevented.
+    staging = tmp_path / ".victim.123-abcdef12.deleting"
+    staging.mkdir()
+    fd = os.open(staging, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        fd_stat = os.fstat(fd)
+        # Swap in a non-empty replacement, and fool the identity check so the
+        # code reaches the actual rmdir against the replacement.
+        os.rmdir(staging)
+        staging.mkdir()
+        (staging / "payload.txt").write_text("bystander", encoding="utf-8")
+        monkeypatch.setattr(core.os, "stat", lambda *a, **k: fd_stat)
+
+        with pytest.raises(OSError):
+            core._rmdir_verified_staging(staging, fd)
+
+        assert (staging / "payload.txt").read_text(encoding="utf-8") == "bystander"
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX dir_fd deletion semantics")
 def test_staging_replacement_during_fd_bound_delete_is_not_deleted(
     tmp_path,
     registry,

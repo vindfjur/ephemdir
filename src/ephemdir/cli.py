@@ -4,37 +4,72 @@ Exposes the library through a small ``ephemdir`` command:
 
 * ``ephemdir new``        -- create a new ephemeral directory and print its path
 * ``ephemdir list``       -- show tracked directories with status and time left
+* ``ephemdir tree``       -- show tracked directories grouped by parent, with sizes
 * ``ephemdir path``       -- print the path of a tracked directory by name
+* ``ephemdir last``       -- print the most recently created tracked directory
 * ``ephemdir keep``       -- stop tracking a directory (make it permanent)
 * ``ephemdir extend``     -- give a directory a fresh lifetime
 * ``ephemdir rm``         -- remove a tracked directory now
 * ``ephemdir sweep``      -- remove every directory that is due for cleanup
+* ``ephemdir explain``    -- trace why a directory will or will not be removed
+* ``ephemdir stats``      -- show lifetime usage counters
 * ``ephemdir prune``      -- forget missing tracked directories explicitly
 * ``ephemdir watch``      -- run a foreground loop that sweeps periodically
 * ``ephemdir shell-init`` -- print shell functions (``ecd``, ``enew``) to eval
+
+Read-only commands (``list``, ``tree``, ``path``, ``last``, ``explain``,
+``doctor``) accept ``--json`` for a stable machine-readable contract; the global
+``--color {auto,always,never}`` flag (honouring ``NO_COLOR``) controls ANSI
+colour, which is off automatically when output is piped.
+
+``ephemdir new`` accepts ``--tag`` (repeatable) and ``--desc`` to label a
+directory; ``list``, ``tree``, ``sweep`` and ``keep`` accept ``--tag`` to act
+only on directories carrying every given tag.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import sys
 import time
 from collections.abc import Sequence
-from datetime import datetime
 from pathlib import Path
 from typing import Any, TextIO
 
 from . import __version__
 from ._completion import completion_script
-from ._display import escape_human_text, format_decision
+from ._display import (
+    Painter,
+    color_enabled,
+    emit_json,
+    escape_human_text,
+    explain_payload,
+    explain_trace,
+    format_decision,
+    format_size,
+    supports_unicode,
+)
+from ._display import (
+    format_duration as _format_duration,
+)
+from ._display import (
+    format_timestamp as _format_timestamp,  # noqa: F401 - re-exported for tests/scripts
+)
 from ._doctor import run_doctor
 from ._menu import run_menu
 from ._platform import boot_session_id, boot_time
-from ._registry import Entry, RegistryFormatError, RegistryUnavailableError, UnsafeRegistryError
+from ._registry import (
+    Entry,
+    RegistryFormatError,
+    RegistryUnavailableError,
+    UnsafeRegistryError,
+    _valid_tag,
+)
 from ._service import ServiceError, install_service, uninstall_service
+from ._size import measure_tree
+from ._stats import StatsLedger
 from .core import (
     _UNSET,
     _current_target_path,
@@ -73,6 +108,26 @@ _ICONS = {
     "recovery": "🚧",
     "unavailable": "❓",
     "blocked": "⛔",
+}
+# Statuses ephemdir owns and may safely measure in `tree` (see _measured_size).
+_MEASURABLE_STATUSES = frozenset(
+    {"active", "expiring", "expired", "until-restart", "until-sweep", "kept"}
+)
+# Colour styles per status, applied to the note column of `ephemdir list`.
+_STATUS_STYLES = {
+    "active": ("green",),
+    "expiring": ("yellow",),
+    "expired": ("red",),
+    "until-restart": ("cyan",),
+    "until-sweep": ("cyan",),
+    "kept": ("green",),
+    "missing": ("dim",),
+    "replaced": ("yellow",),
+    "legacy": ("dim",),
+    "deleting": ("yellow",),
+    "recovery": ("red",),
+    "unavailable": ("dim",),
+    "blocked": ("red",),
 }
 _ASCII_ICONS = {
     "active": "[ok]  ",
@@ -165,25 +220,15 @@ def _configure_logging(verbosity: int, quiet: bool) -> None:
     logging.basicConfig(level=level, format="%(message)s", stream=sys.stderr, force=True)
 
 
-def _format_timestamp(value: object) -> str:
-    """Render a Unix timestamp as a readable local time, or ``never``."""
-    if not isinstance(value, (int, float)):
-        return "never"
-    return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+def _painter(stream: TextIO, args: argparse.Namespace) -> Painter:
+    """Build a colour painter for ``stream`` honouring the global --color flag."""
+    return Painter(color_enabled(stream, getattr(args, "color", "auto")))
 
 
-def _format_duration(seconds: float) -> str:
-    """Humanize a duration: ``"1d 4h"``, ``"1h 23m"``, ``"5m 12s"``, ``"42s"``.
-
-    At most the two largest non-zero units are shown.
-    """
-    total = max(0, int(seconds))
-    components = [("d", total // 86400), ("h", total % 86400 // 3600),
-                  ("m", total % 3600 // 60), ("s", total % 60)]
-    nonzero = [(unit, value) for unit, value in components if value]
-    if not nonzero:
-        return "0s"
-    return " ".join(f"{value}{unit}" for unit, value in nonzero[:2])
+def _fail(args: argparse.Namespace, message: object) -> None:
+    """Emit a uniform ``ephemdir: <command>: <reason>`` error to stderr."""
+    command = getattr(args, "command", None) or "ephemdir"
+    logger.error("ephemdir: %s: %s", command, message)
 
 
 def _status_note(status: str, entry: Entry, now: float) -> str:
@@ -241,6 +286,45 @@ def _created_at(entry: Entry) -> float:
     return float(value) if isinstance(value, (int, float)) else 0.0
 
 
+def _entry_tags(entry: Entry) -> list[str]:
+    tags = entry.get("tags")
+    return [tag for tag in tags if isinstance(tag, str)] if isinstance(tags, list) else []
+
+
+def _entry_description(entry: Entry) -> str | None:
+    description = entry.get("description")
+    return description if isinstance(description, str) else None
+
+
+def _matches_tags(entry: Entry, wanted: list[str] | None) -> bool:
+    """True when ``entry`` carries every requested tag (AND filter)."""
+    if not wanted:
+        return True
+    have = set(_entry_tags(entry))
+    return all(tag in have for tag in wanted)
+
+
+def _reject_invalid_filter_tags(args: argparse.Namespace) -> bool:
+    """Report (and signal exit 2 on) an invalid ``--tag`` filter value.
+
+    A bogus filter tag is a usage error, mirroring tag validation at creation,
+    rather than silently matching nothing.
+    """
+    for tag in getattr(args, "tag", None) or []:
+        if not _valid_tag(tag):
+            _fail(
+                args,
+                f"invalid tag {tag!r}: tags are lowercase, start with a letter or "
+                "digit, use only a-z 0-9 . _ -, and are at most 32 characters",
+            )
+            return True
+    return False
+
+
+def _format_tags(tags: list[str], paint: Painter) -> str:
+    return paint(" ".join(f"#{escape_human_text(tag)}" for tag in tags), "cyan")
+
+
 def _cmd_new(args: argparse.Namespace) -> int:
     # Forward only options the user actually passed, so anything left unset is
     # resolved from the user config file (and then the built-in defaults).
@@ -265,12 +349,16 @@ def _cmd_new(args: argparse.Namespace) -> int:
         kwargs["max_size"] = args.max_size
     if args.name_style is not _UNSET:
         kwargs["name_style"] = args.name_style
+    if args.tag:
+        kwargs["tags"] = args.tag
+    if args.desc is not None:
+        kwargs["description"] = args.desc
 
     try:
         directory = tempdir(**kwargs)
     except (TypeError, ValueError, OSError, LookupError) as error:
         # Bad user input or an unwritable registry: a message, not a traceback.
-        logger.error("%s", error)
+        _fail(args, error)
         return 2
     # The path goes to stdout so it can be captured in shell pipelines;
     # all diagnostics go to stderr via the logger.
@@ -279,8 +367,11 @@ def _cmd_new(args: argparse.Namespace) -> int:
 
 
 def _cmd_sweep(args: argparse.Namespace) -> int:
+    if _reject_invalid_filter_tags(args):
+        return 2
+    tags = args.tag or None
     if args.dry_run:
-        decisions = plan_sweep(force=args.force)
+        decisions = plan_sweep(force=args.force, tags=tags)
         count = 0
         for decision in decisions:
             if decision.due:
@@ -289,7 +380,7 @@ def _cmd_sweep(args: argparse.Namespace) -> int:
                     count += 1
         logger.warning("would sweep %d director%s", count, "y" if count == 1 else "ies")
         return 0
-    count = sweep(force=args.force)
+    count = sweep(force=args.force, tags=tags)
     logger.warning("swept %d director%s", count, "y" if count == 1 else "ies")
     return 0
 
@@ -299,30 +390,59 @@ def _cmd_explain(args: argparse.Namespace) -> int:
         target = args.target if args.target is not None else _current_target_path()
         decision = explain(target)
     except LookupError as error:
-        logger.error("%s", error)
+        _fail(args, error)
         return 1
-    print(format_decision(decision))
+    now = time.time()
+    entry = registered().get(str(decision.path), {})
+    if args.json:
+        emit_json(explain_payload(decision, entry, now))
+        return 0
+    paint = _painter(sys.stdout, args)
+    ascii_only = not supports_unicode(sys.stdout)
+    print(explain_trace(decision, entry, now, paint, ascii_only=ascii_only))
     return 0
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
     checks = run_doctor()
     if args.json:
-        print(json.dumps([check.__dict__ for check in checks], indent=2))
+        emit_json([check.__dict__ for check in checks])
     else:
+        paint = _painter(sys.stdout, args)
         for check in checks:
-            status = "ok" if check.ok else "fail"
-            print(f"{status:<4} {check.name:<12} {check.message}")
+            status = paint("ok", "green") if check.ok else paint("fail", "red")
+            print(f"{status:<4} {check.name:<15} {escape_human_text(check.message)}")
             if check.hint:
-                print(f"     hint: {check.hint}")
+                print(f"     hint: {escape_human_text(check.hint)}")
     return 0 if all(check.ok for check in checks) else 1
+
+
+def _cmd_stats(args: argparse.Namespace) -> int:
+    counters = StatsLedger().snapshot()
+    tracked = sum(
+        1 for entry in registered().values() if entry.get("state", "active") == "active"
+    )
+    if args.json:
+        emit_json({**counters, "currently_tracked": tracked})
+        return 0
+    rows = [
+        ("created", counters["created"]),
+        ("automatically swept", counters["swept"]),
+        ("kept", counters["kept"]),
+        ("manually removed", counters["removed"]),
+        ("currently tracked", tracked),
+    ]
+    label_width = max(len(label) for label, _ in rows)
+    for label, value in rows:
+        print(f"{label:<{label_width}}  {value}")
+    return 0
 
 
 def _cmd_completion(args: argparse.Namespace) -> int:
     try:
         print(completion_script(args.shell), end="")
     except ValueError as error:
-        logger.error("%s", error)
+        _fail(args, error)
         return 2
     return 0
 
@@ -332,6 +452,8 @@ def _cmd_menu(args: argparse.Namespace) -> int:
 
 
 def _cmd_list(args: argparse.Namespace) -> int:
+    if _reject_invalid_filter_tags(args):
+        return 2
     state = registered()
     now = time.time()
     current_boot = boot_time()
@@ -343,13 +465,17 @@ def _cmd_list(args: argparse.Namespace) -> int:
         status = dir_status(entry, path, now, current_boot, current_boot_id)
         rows.append((path, entry, status))
     rows.sort(key=lambda row: (_created_at(row[1]), str(row[0])))
+    if args.tag:
+        rows = [row for row in rows if _matches_tags(row[1], args.tag)]
 
     if args.json:
         payload = []
         for path, entry, status in rows:
             expires_at = entry.get("expires_at")
+            # Duration fields are integer seconds in the JSON contract, matching
+            # explain --json (CONTRACT.md / RC4-1).
             remaining = (
-                float(expires_at) - now if isinstance(expires_at, (int, float)) else None
+                int(float(expires_at) - now) if isinstance(expires_at, (int, float)) else None
             )
             staging_value = entry.get("staging_path")
             staging_path = Path(staging_value) if isinstance(staging_value, str) else None
@@ -370,24 +496,129 @@ def _cmd_list(args: argparse.Namespace) -> int:
                     "remaining_seconds": remaining,
                     "remove_on_restart": bool(entry.get("remove_on_restart")),
                     "keep_while_in_use": bool(entry.get("keep_while_in_use")),
+                    "tags": _entry_tags(entry),
+                    "description": _entry_description(entry),
                 }
             )
-        print(json.dumps(payload, indent=2))
+        emit_json(payload)
         return 0
 
     if not rows:
         logger.warning("no tracked directories")
         return 0
 
+    paint = _painter(sys.stdout, args)
     icons = _ICONS if not args.plain and _supports_emoji(sys.stdout) else _ASCII_ICONS
     name_width = max(len(path.name) for path, _, _ in rows)
     notes = [_status_note(status, entry, now) for _, entry, status in rows]
     note_width = max(len(note) for note in notes)
-    for (path, _, status), note in zip(rows, notes, strict=True):
+    for (path, entry, status), note in zip(rows, notes, strict=True):
+        styles = _STATUS_STYLES.get(status, ())
+        padded_note = paint(f"{note:<{note_width}}", *styles)
+        tags = _entry_tags(entry)
+        suffix = f"  {_format_tags(tags, paint)}" if tags else ""
         print(
             f"{icons[status]} {escape_human_text(path.name):<{name_width}}  "
-            f"{note:<{note_width}}  {escape_human_text(path)}"
+            f"{padded_note}  {escape_human_text(path)}{suffix}"
         )
+        description = _entry_description(entry)
+        if description:
+            print(f"     {paint(escape_human_text(description), 'dim')}")
+    return 0
+
+
+def _measured_size(path: Path, status: str) -> tuple[int | None, bool]:
+    """Best-effort size for `tree`, restricted to ephemdir-owned directories.
+
+    Only directories ephemdir still owns and is actively tracking are measured.
+    A `replaced`/`legacy`/`blocked`/`recovery`/`deleting` directory is shown but
+    never walked: ephemdir has already classified it as not-ours or off-limits,
+    so fd-walking it would widen the read surface to a foreign tree and hand a
+    local racer a per-directory scan-budget DoS lever (RC3-1).
+    """
+    if status not in _MEASURABLE_STATUSES or _path_state(path) != "present":
+        return None, True
+    result = measure_tree(path)
+    return result.bytes, result.complete
+
+
+def _render_size(num_bytes: int | None, complete: bool, paint: Painter) -> str:
+    if num_bytes is None:
+        return paint("?", "dim")
+    text = format_size(num_bytes)
+    if not complete:
+        text = "≥" + text  # >= : a measured lower bound
+    return paint(text, "dim")
+
+
+def _cmd_tree(args: argparse.Namespace) -> int:
+    if _reject_invalid_filter_tags(args):
+        return 2
+    state = registered()
+    now = time.time()
+    current_boot = boot_time()
+    current_boot_id = boot_session_id()
+
+    items = []
+    for path_str, entry in state.items():
+        if not _matches_tags(entry, args.tag):
+            continue
+        path = Path(path_str)
+        status = dir_status(entry, path, now, current_boot, current_boot_id)
+        size_bytes, complete = _measured_size(path, status)
+        items.append((path, status, size_bytes, complete, _entry_tags(entry)))
+
+    if args.json:
+        emit_json(
+            [
+                {
+                    "path": str(path),
+                    "name": path.name,
+                    "parent": str(path.parent),
+                    "status": status,
+                    "size_bytes": size_bytes,
+                    "size_complete": complete,
+                    "tags": tags,
+                }
+                for path, status, size_bytes, complete, tags in items
+            ]
+        )
+        return 0
+
+    if not items:
+        logger.warning("no tracked directories")
+        return 0
+
+    paint = _painter(sys.stdout, args)
+    icons = _ICONS if not args.plain and _supports_emoji(sys.stdout) else _ASCII_ICONS
+    unicode_ok = supports_unicode(sys.stdout)
+    branch = "  └ " if unicode_ok else "  - "
+
+    groups: dict[str, list[tuple[Path, str, int | None, bool, list[str]]]] = {}
+    for path, status, size_bytes, complete, tags in items:
+        groups.setdefault(str(path.parent), []).append(
+            (path, status, size_bytes, complete, tags)
+        )
+
+    for parent in sorted(groups):
+        children = sorted(groups[parent], key=lambda row: row[0].name)
+        measured = [b for _, _, b, _, _ in children if isinstance(b, int)]
+        any_unknown = any(b is None for _, _, b, _, _ in children)
+        any_incomplete = any(not c for _, _, b, c, _ in children if isinstance(b, int))
+        if not measured:
+            # Every child is unmeasured (non-owned/absent): "?" is honester than 0 B.
+            subtotal_render = _render_size(None, True, paint)
+        else:
+            # An unmeasured or budget-capped child makes the total a lower bound.
+            complete = not any_unknown and not any_incomplete
+            subtotal_render = _render_size(sum(measured), complete, paint)
+        print(f"{escape_human_text(parent)}/  {subtotal_render}")
+        for path, status, size_bytes, complete, tags in children:
+            styles = _STATUS_STYLES.get(status, ())
+            name = paint(escape_human_text(path.name), *styles)
+            suffix = f"  {_format_tags(tags, paint)}" if tags else ""
+            size = _render_size(size_bytes, complete, paint)
+            print(f"{branch}{icons[status]} {name}  {size}{suffix}")
     return 0
 
 
@@ -405,8 +636,11 @@ def _cmd_path(args: argparse.Namespace) -> int:
             except _CurrentTargetNotFound:
                 path = _latest_tracked()
     except LookupError as error:
-        logger.error("%s", error)
+        _fail(args, error)
         return 1
+    if getattr(args, "json", False):
+        emit_json({"path": str(path), "name": path.name})
+        return 0
     print(path)
     return 0
 
@@ -426,13 +660,58 @@ def _latest_tracked() -> Path:
 
 
 def _cmd_keep(args: argparse.Namespace) -> int:
+    if args.tag:
+        return _cmd_keep_by_tag(args)
     try:
         target = args.target if args.target is not None else _current_target_path()
         path = keep(target)
     except LookupError as error:
-        logger.error("%s", error)
+        _fail(args, error)
         return 1
     logger.warning("kept %s -- it will not be auto-removed", path)
+    print(path)
+    return 0
+
+
+def _cmd_keep_by_tag(args: argparse.Namespace) -> int:
+    """Keep every active directory carrying all of the requested tags."""
+    if _reject_invalid_filter_tags(args):
+        return 2
+    if args.target is not None:
+        _fail(args, "give a directory or --tag, not both")
+        return 2
+    matches = [
+        Path(key)
+        for key, entry in registered().items()
+        if entry.get("state", "active") == "active" and _matches_tags(entry, args.tag)
+    ]
+    kept = 0
+    failed = 0
+    for path in matches:
+        try:
+            result = keep(str(path))
+        except (LookupError, OSError) as error:
+            # One unkeepable directory (e.g. claimed by a concurrent sweep) must
+            # not abort the batch; report it and continue, but the command still
+            # fails so scripts see that not everything was kept (RC9-1).
+            failed += 1
+            _fail(args, error)
+            continue
+        kept += 1
+        print(result)
+    logger.warning("kept %d director%s", kept, "y" if kept == 1 else "ies")
+    return 1 if failed else 0
+
+
+def _cmd_last(args: argparse.Namespace) -> int:
+    try:
+        path = _latest_tracked()
+    except LookupError as error:
+        _fail(args, error)
+        return 1
+    if getattr(args, "json", False):
+        emit_json({"path": str(path), "name": path.name})
+        return 0
     print(path)
     return 0
 
@@ -453,7 +732,7 @@ def _cmd_extend(args: argparse.Namespace) -> int:
     arg1, arg2, forever = args.arg1, args.arg2, args.forever
     if arg2 is not None:
         if forever:
-            logger.error("--forever cannot be combined with a lifetime")
+            _fail(args, "--forever cannot be combined with a lifetime")
             return 2
         target, lifetime_str = arg1, arg2
     elif arg1 is not None:
@@ -461,24 +740,24 @@ def _cmd_extend(args: argparse.Namespace) -> int:
             if _looks_like_lifetime(arg1):
                 # `extend --forever 2h` (a lone lifetime + --forever) is a
                 # combination error, not a directory named "2h".
-                logger.error("--forever cannot be combined with a lifetime")
+                _fail(args, "--forever cannot be combined with a lifetime")
                 return 2
             target, lifetime_str = arg1, None            # extend <target> --forever
         elif _looks_like_lifetime(arg1):
             target, lifetime_str = None, arg1            # extend <lifetime> (current)
         else:
-            logger.error("specify a lifetime (e.g. 2h) or --forever")
+            _fail(args, "specify a lifetime (e.g. 2h) or --forever")
             return 2
     elif forever:
         target, lifetime_str = None, None                # extend --forever (current)
     else:
-        logger.error("specify a lifetime (e.g. 2h) or --forever")
+        _fail(args, "specify a lifetime (e.g. 2h) or --forever")
         return 2
     try:
         resolved = target if target is not None else _current_target_path()
         path = extend(resolved, None if forever else lifetime_str)
     except (LookupError, ValueError) as error:
-        logger.error("%s", error)
+        _fail(args, error)
         return 1
     if forever:
         logger.warning("extended %s -- no time limit (restart policy still applies)", path)
@@ -492,7 +771,7 @@ def _cmd_rm(args: argparse.Namespace) -> int:
         target = args.target if args.target is not None else _current_target_path()
         path = remove(target)
     except (LookupError, OSError) as error:
-        logger.error("%s", error)
+        _fail(args, error)
         return 1
     logger.warning("removed %s", path)
     return 0
@@ -503,7 +782,7 @@ def _cmd_recover(args: argparse.Namespace) -> int:
     try:
         path = recover(args.target, action=action)
     except (LookupError, OSError, ValueError) as error:
-        logger.error("%s", error)
+        _fail(args, error)
         return 1
     if action == "forget":
         logger.warning("forgot recovery entry for %s; no files were deleted", path)
@@ -520,7 +799,7 @@ def _cmd_prune(args: argparse.Namespace) -> int:
 
 def _cmd_watch(args: argparse.Namespace) -> int:
     if args.interval < 1:
-        logger.error("--interval must be >= 1 second")
+        _fail(args, "--interval must be >= 1 second")
         return 2
     logger.warning("watching; sweeping every %d seconds (Ctrl-C to stop)", args.interval)
     try:
@@ -552,7 +831,7 @@ def _cmd_install_service(args: argparse.Namespace) -> int:
             interval=args.interval, runtime_policy=args.runtime_policy
         )
     except (ServiceError, ValueError) as error:
-        logger.error("%s", error)
+        _fail(args, error)
         return 1
     logger.warning("%s", message)
     return 0
@@ -562,7 +841,7 @@ def _cmd_uninstall_service(args: argparse.Namespace) -> int:
     try:
         message = uninstall_service()
     except ServiceError as error:
-        logger.error("%s", error)
+        _fail(args, error)
         return 1
     logger.warning("%s", message)
     return 0
@@ -577,6 +856,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="increase verbosity")
     parser.add_argument("-q", "--quiet", action="store_true", help="only report errors")
+    parser.add_argument(
+        "--color",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help="when to colourize output (default: auto; also honours NO_COLOR)",
+    )
 
     sub = parser.add_subparsers(
         dest="command",
@@ -606,6 +891,10 @@ def build_parser() -> argparse.ArgumentParser:
     new.add_argument("--prefix", default=_UNSET, help="prefix for the generated name")
     new.add_argument("--words", type=int, default=_UNSET,
                      help="words in the generated name (default: 2)")
+    new.add_argument("--tag", action="append", default=None, metavar="TAG",
+                     help="add a tag for grouping/filtering (repeatable)")
+    new.add_argument("--desc", "--description", dest="desc", default=None,
+                     help="one-line description shown in list and explain")
     new.set_defaults(func=_cmd_new)
 
     list_cmd = sub.add_parser("list", help="show tracked directories with time left")
@@ -613,6 +902,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help="machine-readable output for scripting")
     list_cmd.add_argument("--plain", action="store_true",
                           help="use ASCII status tags instead of emoji")
+    list_cmd.add_argument("--tag", action="append", default=None, metavar="TAG",
+                          help="only show directories carrying this tag (repeatable; AND)")
     list_cmd.set_defaults(func=_cmd_list)
 
     path_cmd = sub.add_parser(
@@ -620,13 +911,36 @@ def build_parser() -> argparse.ArgumentParser:
     path_cmd.add_argument("target", nargs="?", default=None,
                           help="directory name, unique prefix or path (default: the "
                                "current ephemdir directory, else the most recently created)")
+    path_cmd.add_argument("--json", action="store_true", help="machine-readable output")
     path_cmd.set_defaults(func=_cmd_path)
+
+    last_cmd = sub.add_parser(
+        "last", help="print the most recently created tracked directory")
+    last_cmd.add_argument("--json", action="store_true", help="machine-readable output")
+    last_cmd.set_defaults(func=_cmd_last)
+
+    stats_cmd = sub.add_parser(
+        "stats", help="show lifetime usage counters")
+    stats_cmd.add_argument("--json", action="store_true", help="machine-readable output")
+    stats_cmd.set_defaults(func=_cmd_stats)
+
+    tree_cmd = sub.add_parser(
+        "tree", help="show tracked directories grouped by parent, with sizes")
+    tree_cmd.add_argument("--json", action="store_true",
+                          help="machine-readable output for scripting")
+    tree_cmd.add_argument("--plain", action="store_true",
+                          help="use ASCII status tags instead of emoji")
+    tree_cmd.add_argument("--tag", action="append", default=None, metavar="TAG",
+                          help="only show directories carrying this tag (repeatable; AND)")
+    tree_cmd.set_defaults(func=_cmd_tree)
 
     keep_cmd = sub.add_parser(
         "keep", help="stop tracking a directory so it is never auto-removed")
     keep_cmd.add_argument("target", nargs="?", default=None,
                           help="directory name, unique prefix or path "
                                "(default: the current ephemdir directory)")
+    keep_cmd.add_argument("--tag", action="append", default=None, metavar="TAG",
+                          help="keep every directory carrying this tag (repeatable; AND)")
     keep_cmd.set_defaults(func=_cmd_keep)
 
     extend_cmd = sub.add_parser("extend", help="give a directory a fresh lifetime from now")
@@ -650,12 +964,15 @@ def build_parser() -> argparse.ArgumentParser:
                            help="remove every tracked directory regardless of policy")
     sweep_cmd.add_argument("--dry-run", action="store_true",
                            help="preview what would be removed without deleting anything")
+    sweep_cmd.add_argument("--tag", action="append", default=None, metavar="TAG",
+                           help="only sweep directories carrying this tag (repeatable; AND)")
     sweep_cmd.set_defaults(func=_cmd_sweep)
 
     explain_cmd = sub.add_parser("explain", help="explain cleanup state for a directory")
     explain_cmd.add_argument("target", nargs="?", default=None,
                              help="directory name, unique prefix or path "
                                   "(default: the current ephemdir directory)")
+    explain_cmd.add_argument("--json", action="store_true", help="machine-readable output")
     explain_cmd.set_defaults(func=_cmd_explain)
 
     doctor_cmd = sub.add_parser("doctor", help="diagnose ephemdir safety prerequisites")
@@ -740,22 +1057,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     _configure_logging(args.verbose, args.quiet)
+    # ephemdir is POSIX-only. On other platforms refuse with one clear message
+    # instead of leaking a confusing OSError from a failed data-dir create or a
+    # misleading "no tracked directories". `doctor` still runs so the user can
+    # see why.
+    if os.name != "posix" and getattr(args, "command", None) != "doctor":
+        logger.error(
+            "ephemdir: %s: ephemdir is not supported on this platform; it requires "
+            "a POSIX system (Linux or macOS). Run `ephemdir doctor` for details.",
+            getattr(args, "command", "ephemdir"),
+        )
+        return 1
     try:
         exit_code: int = args.func(args)
     except TimeoutError as error:
         # The registry lock could not be acquired; nothing was modified.
-        logger.error("%s", error)
+        _fail(args, error)
         return 1
     except UnsafeRegistryError as error:
         # The registry is writable by other users and was left untouched: a
         # clear message, not a traceback, and definitely no destructive action.
-        logger.error("%s", error)
+        _fail(args, error)
         return 1
     except PermissionError as error:
-        logger.error("%s", error)
+        _fail(args, error)
         return 1
     except (RegistryFormatError, RegistryUnavailableError) as error:
-        logger.error("%s", error)
+        _fail(args, error)
         return 1
     return exit_code
 
