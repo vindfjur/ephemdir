@@ -797,10 +797,16 @@ def test_copied_marker_cannot_override_staging_inode_mismatch(tmp_path, registry
     staging = d.path.parent / f".{d.path.name}.123-abcdef12.deleting"
     os.replace(d.path, staging)
     marker = (staging / _MARKER_NAME).read_text(encoding="utf-8")
+    foreign = tmp_path / "foreign-staging"
+    foreign.mkdir()
+    (foreign / _MARKER_NAME).write_text(marker, encoding="utf-8")
+    (foreign / "innocent.txt").write_text("foreign", encoding="utf-8")
+
+    # Allocate the replacement while the original staging inode is still live.
+    # Creating it after rmtree lets ext4 immediately reuse the recorded inode,
+    # accidentally turning this intended mismatch scenario into a match.
     shutil.rmtree(staging)
-    staging.mkdir()
-    (staging / _MARKER_NAME).write_text(marker, encoding="utf-8")
-    (staging / "innocent.txt").write_text("foreign", encoding="utf-8")
+    os.replace(foreign, staging)
 
     assert core._staging_ownership(d.path, staging, entry) == "foreign"
     with registry.transaction() as state:
