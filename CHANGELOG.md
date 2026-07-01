@@ -4,6 +4,60 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-07-01
+
+### Added
+- `ephemdir stats` shows lifetime usage counters — directories created,
+  automatically swept, kept, and removed by hand, plus how many are currently
+  tracked (`--json` available). The counters live in a small owner-only ledger
+  and are best-effort: they never block or fail a real operation.
+- `ephemdir sweep --tag` removes only directories carrying every given tag, and
+  `ephemdir keep --tag` keeps (untracks) every directory carrying them. The
+  sweep filter can only narrow what is removed.
+- Per-directory **tags** and a **description**. Set them at creation with
+  `ephemdir new --tag rust --tag build --desc "cargo benchmark"` (or
+  `tempdir(tags=[...], description="...")`). Tags and the description appear in
+  `list`, `tree` and `explain` (human and `--json`), and `list`/`tree` accept
+  `--tag` to filter to directories carrying every given tag. Tags are lowercase
+  `[a-z0-9._-]`, start alphanumerically, ≤ 32 chars, ≤ 16 per directory; the
+  description is ≤ 256 bytes with no control characters.
+- `ephemdir tree` shows tracked directories grouped by their parent directory,
+  with a measured size for each (and a per-group subtotal). Sizes use binary
+  units (KiB/MiB/GiB) and a `≥` prefix when a directory is too large to measure
+  within the scan budget.
+- `ephemdir last` prints the most recently created tracked directory that still
+  exists.
+- `ephemdir explain` now prints a readable decision trace — the headline verdict
+  ("kept", "due", "held back") followed by the exact reasons it is due and the
+  blockers holding it back — instead of a single dense line.
+- A stable `--json` contract on the read-only commands `explain`, `path`, `last`
+  and `tree` (joining `list` and `doctor`), so scripts get machine-readable
+  output on stdout while diagnostics stay on stderr.
+- A global `--color {auto,always,never}` flag. Colour is enabled only for an
+  interactive terminal by default, is disabled when output is piped, and honours
+  the `NO_COLOR` convention.
+
+### Changed
+- The project is now licensed under the Apache License 2.0 (previously MIT). The
+  change is permissive-to-permissive and adds an explicit patent grant; earlier
+  releases remain under their original MIT terms.
+- Errors now use a uniform `ephemdir: <command>: <reason>` form on stderr.
+- On non-POSIX platforms (e.g. Windows), commands now refuse up front with one
+  clear message — "ephemdir is not supported on this platform; it requires a
+  POSIX system (Linux or macOS)" — instead of a confusing permission error or a
+  misleading empty list. `ephemdir doctor` still runs so the reason is visible.
+- The registry now uses an on-disk schema version 3, adding optional per-entry
+  `tags` and `description` fields. A registry written by an earlier version is
+  read as before and upgraded to the new format the next time it is modified.
+  Before upgrading, ephemdir keeps an untouched, owner-only backup of the old
+  file beside the registry (for example `registry.json.v2.bak`) and never
+  overwrites an existing backup. Read-only commands (`list`, `tree`, `path`,
+  `last`, `explain`, `doctor`) leave the file untouched. A registry written by a newer
+  ephemdir is still refused rather than rewritten, and a corrupt or
+  foreign-owned registry is never silently replaced with an empty one.
+- `ephemdir doctor` now reports the on-disk registry schema version and whether
+  an upgrade is pending on the next change.
+
 ## [0.6.0] - 2026-06-27
 
 ### Added

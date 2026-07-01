@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-The supported release line is `0.6.x` (with `0.5.x` still receiving security
+The supported release line is `0.7.x` (with `0.6.x` still receiving security
 fixes). Supported runtimes are Python 3.10+ on Linux and macOS. Windows is not
 supported until a handle-bound recursive deletion backend is available.
 
@@ -25,19 +25,35 @@ has been triaged.
 
 ephemdir only deletes directories it can verify by marker and inode identity.
 POSIX deletion is fd-relative and refuses symlink, parent-trust and mount-boundary
-violations. When a platform cannot provide the required safe primitive,
+violations. The owned staging tree's contents are removed through opened
+directory descriptors; only the final removal of the now-empty staging directory
+is by pathname, because POSIX offers no fd-only `rmdir`. That last step carries a
+small, accepted same-user race: a racing same-user process could swap an *empty*
+replacement into the staging path between the identity check and the `rmdir`. The
+window is bounded — `rmdir` refuses a non-empty directory, a symlink or a
+mountpoint, so any replacement holding data survives, and only an empty directory
+the racer itself created could be removed (not a privilege-boundary break). When a
+platform cannot provide the required safe primitive,
 `tempdir()` fails before creation and cleanup fails closed before claim: the
 original pathname and active entry stay untouched rather than being moved or
 deleted by pathname. A missing active path is not treated as proof that cleanup
 succeeded: the entry remains tracked and blocked until ephemdir verifies a
 deletion, or until the user explicitly forgets it with `prune`, `keep` or
-`recover --forget` for recovery entries. Registry reads and writes are bounded to 1 MiB, use a v2
-envelope on write, and use non-blocking no-follow opens, preventing FIFOs and
-other special files from stalling commands or the scheduled sweeper. A registry
-that is group/world-*writable* is treated as potentially tampered: it is refused
-outright (not parsed, swept, emptied or quarantined) and left in place for
-manual inspection, while a merely world-*readable* legacy registry is tightened
-to `0600` on load. Any malformed individual registry entry makes the whole
+`recover --forget` for recovery entries. Registry reads and writes are bounded to 1 MiB, use a versioned
+envelope (schema v3, which adds optional per-directory `tags` and `description`)
+on write, and use non-blocking no-follow opens, preventing FIFOs and other
+special files from stalling commands or the scheduled sweeper. An older on-disk
+schema is read unchanged and upgraded to the current one the next time a command
+modifies the registry, after copying the old file to an owner-only backup beside
+it (for example `registry.json.v2.bak`); an existing backup is never overwritten,
+and a registry written by a *newer* ephemdir is refused rather than rewritten. A
+registry that is group/world-*writable* is treated as potentially tampered: it is
+refused outright (not parsed, swept, emptied or quarantined) and left in place
+for manual inspection. A merely world-/group-*readable* registry is tightened to
+`0600` by the next command that writes it; a read-only command (`list`, `tree`,
+`path`, `last`, `explain`) deliberately does not mutate it and instead logs a
+warning, and `doctor` reports it as a finding. Because the registry now stores
+`tags`/`description`, keeping it owner-only also keeps those labels private. Any malformed individual registry entry makes the whole
 registry invalid for that command; transactions copy the inspected bytes to a
 unique `registry.json.corrupt-*` file, leave the active registry path in place
 as a blocking object and abort instead of saving a filtered or empty state.

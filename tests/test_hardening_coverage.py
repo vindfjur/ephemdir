@@ -289,8 +289,8 @@ def test_doctor_directory_and_registry_diagnostics(tmp_path, monkeypatch):
     reg = Registry(path=tmp_path / "registry.json")
     reg.save({})
     monkeypatch.setattr(_doctor.os, "getuid", lambda: reg.path.stat().st_uid, raising=False)
-    assert _doctor._diagnose_registry(reg.path) == 0
-    assert _doctor._registry_check(reg).ok is True
+    assert _doctor._diagnose_registry(reg.path) == (0, _doctor._REGISTRY_SCHEMA_VERSION)
+    assert all(check.ok for check in _doctor._registry_checks(reg))
 
 
 def test_doctor_chain_and_registry_error_mapping(tmp_path, monkeypatch):
@@ -312,7 +312,7 @@ def test_doctor_chain_and_registry_error_mapping(tmp_path, monkeypatch):
             "_diagnose_registry",
             lambda path, exc=exc: (_ for _ in ()).throw(exc),
         )
-        check = _doctor._registry_check(FakeRegistry())
+        check = _doctor._registry_checks(FakeRegistry())[0]
         assert check.ok is (isinstance(exc, FileNotFoundError))
         assert hint in (check.message + " " + str(check.hint))
 

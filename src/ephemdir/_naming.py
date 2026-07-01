@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import unicodedata
 
 __all__ = ["clean_name", "funny_name"]
 
@@ -45,8 +46,12 @@ def _validate_separator(separator: str) -> None:
         forbidden.add(os.altsep)
     if any(token in separator for token in forbidden):
         raise ValueError("separator must not contain path separators or NUL")
-    if any(ord(character) < 32 or ord(character) == 127 for character in separator):
-        raise ValueError("separator must not contain control characters")
+    if any(
+        ord(character) < 32 or ord(character) == 127
+        or unicodedata.category(character) in ("Cc", "Cf", "Cs")
+        for character in separator
+    ):
+        raise ValueError("separator must not contain control or formatting characters")
 
 
 def funny_name(words: int = 2, separator: str = "-") -> str:

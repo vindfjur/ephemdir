@@ -68,8 +68,13 @@ _toml = _import_toml()
 
 
 def config_path() -> Path:
-    """Return the path to the user config file (it may not exist)."""
-    return user_config_dir() / "config.toml"
+    """Return the path to the user config file (it may not exist).
+
+    Reading config must be side-effect-free, so the config directory is not
+    created here (RC8-1) — only commands that actually write config or service
+    files create it.
+    """
+    return user_config_dir(create=False) / "config.toml"
 
 
 def load_config(path: Path | None = None) -> dict[str, Any]:
