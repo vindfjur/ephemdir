@@ -166,6 +166,125 @@ def test_prefix_rejects_control_characters(tmp_path, registry):
         tempdir(parent=tmp_path, prefix="line\n", registry=registry)
 
 
+def test_macos_legacy_entry_detects_fast_reboot_even_with_current_boot_uuid(monkeypatch):
+    monkeypatch.setattr(core.sys, "platform", "darwin")
+    entry = {
+        "created_at": 1.0,
+        "expires_at": None,
+        "remove_on_restart": True,
+        "boot_id": None,
+        "boot_time": 100.0,
+    }
+
+    decision = core.decide_cleanup(
+        Path("/tmp/legacy"),
+        entry,
+        now=200.0,
+        current_boot=160.0,
+        current_boot_id="darwin-boot-11111111-2222-3333-4444-555555555555",
+        mode=core.SweepMode.FULL,
+        path_state="present",
+        ownership="owned",
+        parent_error=None,
+        same_boot_func=core.same_boot,
+    )
+
+    assert decision.reasons == ("restarted",)
+
+
+def test_macos_legacy_restart_entry_is_deleted_by_real_sweep(tmp_path, registry, monkeypatch):
+    d = tempdir(lifetime=None, parent=tmp_path, registry=registry)
+    with registry.transaction() as state:
+        state[str(d.path)]["boot_id"] = None
+        state[str(d.path)]["boot_time"] = 100.0
+        state[str(d.path)]["platform"] = "darwin"
+    monkeypatch.setattr(core.sys, "platform", "darwin")
+    monkeypatch.setattr(core, "boot_time", lambda: 160.0)
+    monkeypatch.setattr(
+        core,
+        "boot_session_id",
+        lambda: "darwin-boot-11111111-2222-3333-4444-555555555555",
+    )
+
+    assert sweep(registry=registry) == 1
+    assert not d.path.exists()
+    assert str(d.path) not in registered(registry=registry)
+
+
+def test_root_only_deletion_resumes_after_marker_was_unlinked(tmp_path, registry):
+    d = tempdir(lifetime="1h", parent=tmp_path, registry=registry)
+    (d.path / "payload.txt").write_text("owned", encoding="utf-8")
+    staging = d.path.parent / f".{d.path.name}.123-abcdef12.deleting"
+    os.rename(d.path, staging)
+    (staging / "payload.txt").unlink()
+    (staging / core._MARKER_NAME).unlink()
+    with registry.transaction() as state:
+        state[str(d.path)].update(
+            {
+                "state": "deleting",
+                "claim_id": None,
+                "staging_path": str(staging),
+                "delete_phase": "root-only",
+            }
+        )
+
+    assert sweep(registry=registry) == 1
+    assert not staging.exists()
+    assert str(d.path) not in registered(registry=registry)
+
+
+def test_root_only_missing_staging_retires_completed_journal(tmp_path, registry):
+    d = tempdir(lifetime="1h", parent=tmp_path, registry=registry)
+    staging = d.path.parent / f".{d.path.name}.123-abcdef12.deleting"
+    shutil.rmtree(d.path)
+    with registry.transaction() as state:
+        state[str(d.path)].update(
+            {
+                "state": "deleting",
+                "claim_id": None,
+                "staging_path": str(staging),
+                "delete_phase": "root-only",
+            }
+        )
+
+    assert sweep(registry=registry) == 1
+    assert str(d.path) not in registered(registry=registry)
+
+
+def test_root_only_backend_requires_recorded_inode_identity(tmp_path):
+    from ephemdir._backends import posix
+
+    staging = tmp_path / ".victim.1-aabbccdd.deleting"
+    staging.mkdir()
+    entry = {"marker_id": "a" * 32, "delete_phase": "root-only"}
+
+    with pytest.raises(posix.StagingIdentityError):
+        posix.delete_claimed_tree(staging, entry)
+
+    assert staging.is_dir()
+
+
+def test_root_only_recovery_refuses_unexpected_new_payload(tmp_path, registry):
+    d = tempdir(lifetime="1h", parent=tmp_path, registry=registry)
+    staging = d.path.parent / f".{d.path.name}.123-abcdef12.deleting"
+    os.rename(d.path, staging)
+    (staging / core._MARKER_NAME).unlink()
+    (staging / "foreign.txt").write_text("preserve", encoding="utf-8")
+    with registry.transaction() as state:
+        state[str(d.path)].update(
+            {
+                "state": "deleting",
+                "claim_id": None,
+                "staging_path": str(staging),
+                "delete_phase": "root-only",
+            }
+        )
+
+    assert sweep(registry=registry) == 0
+    assert (staging / "foreign.txt").read_text(encoding="utf-8") == "preserve"
+    assert registered(registry=registry)[str(d.path)]["state"] == "recovery"
+
+
 def test_linux_without_boot_id_does_not_trust_wall_clock(monkeypatch):
     monkeypatch.setattr(core.sys, "platform", "linux")
     entry = {
@@ -239,3 +358,35 @@ def test_journal_recovery_applies_deletion_guard(tmp_path, registry, monkeypatch
     entry = registered(registry=registry)[str(d.path)]
     assert entry["state"] == "recovery"
     assert d.path.is_dir()
+
+
+def test_legacy_recovery_entry_without_identity_fails_before_backend(
+    tmp_path, registry, monkeypatch
+):
+    # Auditor-requested sequencing contract (rc6-hardened re-audit): a legacy
+    # recovery entry lacking recorded dev/ino must be refused by write-time
+    # registry validation BEFORE the deletion backend runs, leaving payload,
+    # marker, staging and tracking byte-for-byte intact.
+    d = tempdir(lifetime="1h", parent=tmp_path, registry=registry)
+    (d.path / "payload.txt").write_text("owned", encoding="utf-8")
+    staging = d.path.parent / f".{d.path.name}.123-abcdef12.deleting"
+    os.rename(d.path, staging)
+    with registry.transaction() as state:
+        entry = state[str(d.path)]
+        entry.update({"state": "recovery", "claim_id": None, "staging_path": str(staging)})
+        entry.pop("dev", None)
+        entry.pop("ino", None)
+    before = dict(registered(registry=registry)[str(d.path)])
+
+    backend_calls: list[Path] = []
+    monkeypatch.setattr(
+        core, "_delete_staging_tree", lambda staging, entry: backend_calls.append(staging)
+    )
+
+    with pytest.raises(Exception, match="invalid|identity|dev"):
+        recover(str(d.path), action="retry", registry=registry)
+
+    assert backend_calls == []
+    assert (staging / "payload.txt").read_text(encoding="utf-8") == "owned"
+    assert (staging / core._MARKER_NAME).is_file()
+    assert registered(registry=registry)[str(d.path)] == before

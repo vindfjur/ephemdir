@@ -13,19 +13,17 @@ import sys
 import time
 import unicodedata
 import uuid
-from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from collections.abc import Sequence
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+from ._backends import posix as _posix_backend
+from ._backends.base import CreatedDirectory
+from ._backends.posix import PosixBackend, StagingIdentityError
 from ._config import load_config
+from ._errors import SafetyError, TargetError, UnsupportedPlatformError
 from ._inuse import is_in_use
-from ._mounts import (
-    MountBoundary,
-    MountBoundaryError,
-    verify_same_mount,
-)
 from ._mounts import (
     linux_mount_id_fdinfo as _shared_linux_mount_id_fdinfo,
 )
@@ -187,70 +185,18 @@ def _parse_duration_string(text: str) -> float:
 # was deleted manually and something else later appeared at the same path, the
 # marker will not match and ephemdir leaves the newcomer alone.
 
-_MARKER_NAME = ".ephemdir"
-_MARKER_ID_PATTERN = re.compile(rb"[0-9a-f]{32}")
-_MARKER_PAYLOAD_MAX_BYTES = 33  # 32 lowercase hex characters plus one LF.
+# The single active POSIX backend instance driving the FS-side operations.
+_BACKEND = PosixBackend()
 
+_MARKER_NAME = _posix_backend.MARKER_NAME
 
-def _parse_marker_payload(payload: bytes) -> str | None:
-    """Validate and decode one bounded ownership-marker payload."""
-    if payload.endswith(b"\n"):
-        payload = payload[:-1]
-    if _MARKER_ID_PATTERN.fullmatch(payload) is None:
-        return None
-    return payload.decode("ascii")
-
-
-def _write_marker(path: Path, marker_id: str | None = None, *, dir_fd: int | None = None) -> str:
-    """Create the ownership marker inside ``path``; return its id.
-
-    Passing an explicit ``marker_id`` recreates a known marker during safe
-    recovery or test setup without changing the ownership identity. When
-    ``dir_fd`` names the already-opened directory, the marker is created
-    relative to that descriptor so a concurrent path swap cannot redirect it.
-    """
-    marker_id = marker_id or uuid.uuid4().hex
-    try:
-        encoded = marker_id.encode("ascii")
-    except UnicodeEncodeError as error:
-        raise ValueError("marker_id must be 32 lowercase hexadecimal characters") from error
-    if _MARKER_ID_PATTERN.fullmatch(encoded) is None:
-        raise ValueError("marker_id must be 32 lowercase hexadecimal characters")
-
-    flags = (
-        os.O_CREAT
-        | os.O_EXCL
-        | os.O_WRONLY
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-    )
-    if dir_fd is not None:
-        fd = os.open(_MARKER_NAME, flags, 0o600, dir_fd=dir_fd)
-    else:
-        fd = os.open(path / _MARKER_NAME, flags, 0o600)
-    try:
-        payload = encoded + b"\n"
-        written = 0
-        while written < len(payload):
-            count = os.write(fd, payload[written:])
-            if count == 0:
-                raise OSError(errno.EIO, "short write while creating ownership marker")
-            written += count
-    finally:
-        os.close(fd)
-    return marker_id
-
-
-def _read_marker(path: Path) -> str | None:
-    """Read a marker through a no-follow directory descriptor."""
-    try:
-        dir_fd = _open_directory_nofollow(path)
-    except (OSError, NotImplementedError, TypeError):
-        return None
-    try:
-        return _read_marker_at(dir_fd)
-    finally:
-        os.close(dir_fd)
+# The marker, ownership-probe and fd-bound deletion implementations live in
+# the POSIX backend (APA-BE-002). The module-level names below stay bound in
+# core because they are the long-standing test seams — the frozen golden
+# fixtures and the hardening suite monkeypatch and call them on this module.
+_parse_marker_payload = _posix_backend.parse_marker_payload
+_write_marker = _posix_backend.write_marker
+_read_marker = _posix_backend.read_marker
 
 
 def _remove_marker_if_ours(path: Path, marker_id: object) -> None:
@@ -282,20 +228,9 @@ def _remove_marker_if_ours(path: Path, marker_id: object) -> None:
 # validated relative to the original directory, not with a broad regex, so a
 # crafted path elsewhere cannot masquerade as ephemdir's staging tree.
 _STAGING_SUFFIX_PATTERN = re.compile(r"^\d+-[0-9a-f]{8}\.deleting$")
+_CONTENTS_CLEARED_CALLBACK_KEY = "_ephemdir_contents_cleared_callback"
 
-
-class _StagingIdentityError(OSError):
-    """Raised when a staging pathname no longer names the verified directory."""
-
-
-@dataclass
-class _DeleteFrame:
-    fd: int
-    names: Iterator[str]
-    parent_fd: int | None
-    name: str | None
-    inode: tuple[int, int]
-    close: bool
+_StagingIdentityError = StagingIdentityError
 
 
 def _valid_staging_path(original: Path, staging: Path) -> bool:
@@ -323,104 +258,19 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def _inode_matches(path: Path, entry: Entry) -> bool | None:
-    """Compare ``path`` against the entry's stored inode *number*.
-
-    Only ``st_ino`` is compared, never ``st_dev``. A device number is not
-    stable across reboots — macOS reassigns it for an APFS volume at every boot,
-    and it is not guaranteed stable on Linux either — so comparing it would mark
-    every tracked directory ``foreign`` after a restart and silently defeat
-    restart/expiry cleanup (the directory is never deleted). The on-disk inode
-    number is stable across reboots, and the random ownership marker is the
-    primary proof of ownership; the inode is a secondary cross-check that still
-    distinguishes a replacement created at the same path (which gets a new
-    inode number).
-
-    Returns ``True``/``False`` for a definite answer and ``None`` when the
-    entry carries no inode information to compare against.
-    """
-    ino = entry.get("ino")
-    if not isinstance(ino, int):
-        return None
-    try:
-        path_stat = os.stat(path, follow_symlinks=False)
-    except OSError:
-        return False
-    return path_stat.st_ino == ino
-
-
-def _fd_inode_matches(fd: int, entry: Entry) -> bool | None:
-    """Compare an already-open directory fd against the entry's stored inode number.
-
-    Like :func:`_inode_matches`, only ``st_ino`` is compared so the check is
-    stable across reboots.
-    """
-    ino = entry.get("ino")
-    if not isinstance(ino, int):
-        return None
-    return os.fstat(fd).st_ino == ino
-
-
-def _is_real_directory(path: Path) -> bool:
-    """Return whether ``path`` itself is a directory, not a symlink to one."""
-    try:
-        path_stat = os.stat(path, follow_symlinks=False)
-    except OSError:
-        return False
-    return stat.S_ISDIR(path_stat.st_mode)
-
-
-def _read_marker_at(dir_fd: int) -> str | None:
-    """Read a small regular marker relative to an open directory descriptor.
-
-    The marker is attacker-controlled once untrusted code can write inside an
-    ephemeral directory.  Fail closed unless no-follow and non-blocking opens
-    are available, reject special files, and never read more than the exact
-    marker envelope.
-    """
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    nonblock = getattr(os, "O_NONBLOCK", 0)
-    if not nofollow or not nonblock:
-        return None
-    flags = os.O_RDONLY | nofollow | nonblock | getattr(os, "O_CLOEXEC", 0)
-    try:
-        fd = os.open(_MARKER_NAME, flags, dir_fd=dir_fd)
-    except (OSError, NotImplementedError, TypeError):
-        return None
-    try:
-        marker_stat = os.fstat(fd)
-        if not stat.S_ISREG(marker_stat.st_mode):
-            return None
-        if marker_stat.st_size > _MARKER_PAYLOAD_MAX_BYTES:
-            return None
-        payload = os.read(fd, _MARKER_PAYLOAD_MAX_BYTES + 1)
-        if len(payload) > _MARKER_PAYLOAD_MAX_BYTES:
-            return None
-        return _parse_marker_payload(payload)
-    except OSError:
-        return None
-    finally:
-        os.close(fd)
+_inode_matches = _posix_backend.inode_matches
+_fd_inode_matches = _posix_backend.fd_inode_matches
+_is_real_directory = _posix_backend.is_real_directory
+_read_marker_at = _posix_backend.read_marker_at
 
 
 def _ownership(path: Path, entry: Entry) -> str:
     """Classify whether ``path`` is still the directory we registered.
 
-    Returns ``"ours"`` (marker and inode verified), ``"foreign"`` (something
-    else occupies the path now) or ``"unverified"`` (cannot be proven either
-    way — such directories are never deleted automatically, only via an
-    explicit ``rm``).
+    Delegates to the POSIX backend's ownership probe; see
+    :func:`ephemdir._backends.posix.ownership` for the classification rules.
     """
-    if not _is_real_directory(path):
-        return "foreign"
-    marker_id = entry.get("marker_id")
-    if not isinstance(marker_id, str):
-        return "unverified"
-    if _read_marker(path) != marker_id:
-        return "foreign"
-    if _inode_matches(path, entry) is False:
-        return "foreign"
-    return "ours"
+    return _BACKEND.probe_ownership(path, entry).status
 
 
 def _staging_ownership(original: Path, staging: Path, entry: Entry) -> str:
@@ -454,6 +304,22 @@ def _staging_ownership(original: Path, staging: Path, entry: Entry) -> str:
     if inode_ok is None:
         return "unverified"
     return "ours"
+
+
+def _recovery_staging_ownership(original: Path, staging: Path, entry: Entry) -> str:
+    """Probe staging ownership while honoring the durable root-only phase."""
+    verdict = _staging_ownership(original, staging, entry)
+    if (
+        verdict == "unverified"
+        and entry.get("delete_phase") == "root-only"
+        and _is_real_directory(staging)
+        and _inode_matches(staging, entry) is True
+    ):
+        # The marker was intentionally removed only after all managed payload
+        # entries were durably recorded as gone. The backend will still remove
+        # only an empty root and reject any replacement that gained content.
+        return "ours"
+    return verdict
 
 
 def _deletion_lock_key(key: str, entry: Entry) -> str:
@@ -518,6 +384,11 @@ def _deletion_guard(path: Path) -> str | None:
         if normalized in resolved.parents:
             return f"ancestor of the {label}"
     return None
+
+
+def _destructive_path_error(path: Path) -> str | None:
+    """Return any critical-target or parent-trust blocker for deletion."""
+    return _deletion_guard(path) or _parent_trust_error(path)
 
 
 def _trusted_component_error(path: Path, info: os.stat_result) -> str | None:
@@ -897,7 +768,7 @@ def tempdir(
 
     backend_error = _safe_delete_backend_error()
     if backend_error is not None:
-        raise OSError(
+        raise UnsupportedPlatformError(
             errno.ENOTSUP,
             f"cannot create an ephemeral directory safely: {backend_error}",
         )
@@ -939,7 +810,7 @@ def tempdir(
         # rename between these steps can redirect them elsewhere.
         try:
             with reg.transaction() as state:
-                path = _create_unique_dir(
+                created = _create_unique_dir(
                     parent_path,
                     settings["prefix"],
                     settings["words"],
@@ -947,12 +818,8 @@ def tempdir(
                     reserved=frozenset(state),
                     parent_fd=parent_fd,
                 )
-                dir_fd = _open_directory_nofollow(path.name, dir_fd=parent_fd)
-                try:
-                    marker_id = _write_marker(path, dir_fd=dir_fd)
-                    path_stat = os.fstat(dir_fd)
-                finally:
-                    os.close(dir_fd)
+                path = created.path
+                marker_id = created.marker_id
                 entry: Entry = {
                     "created_at": now,
                     "expires_at": expires_at,
@@ -971,9 +838,9 @@ def tempdir(
                     "claim_id": None,
                     "staging_path": None,
                 }
-                if path_stat.st_ino:  # 0 means the filesystem does not report inodes
-                    entry["dev"] = path_stat.st_dev
-                    entry["ino"] = path_stat.st_ino
+                if created.ino:  # 0 means the filesystem does not report inodes
+                    entry["dev"] = created.dev
+                    entry["ino"] = created.ino
                 # Only store the optional v3 metadata when set, so an untagged
                 # directory's entry stays byte-identical to earlier versions.
                 if tags_value:
@@ -1235,6 +1102,9 @@ def sweep(
                 if _finish_deletion(reg, str(path), staging, claimed):
                     removed += 1
                     logger.info("finished interrupted deletion of %s", path)
+            elif status == "completed":
+                removed += 1
+                logger.info("finalized interrupted deletion record for %s", path)
             elif status == "recovery":
                 logger.warning(
                     "%s needs manual attention; run `ephemdir recover %s --retry` "
@@ -1369,7 +1239,7 @@ def _recovery_plan_decision(path: Path, entry: Entry) -> CleanupDecision:
             reasons=("recovery-resume",),
             due=True,
         )
-    reason = _deletion_guard(path)
+    reason = _destructive_path_error(path)
     if reason is not None:
         return _blocked_decision(
             path,
@@ -1408,7 +1278,7 @@ def _recovery_plan_decision(path: Path, entry: Entry) -> CleanupDecision:
             reasons=("recovery-resume",),
             due=True,
         )
-    staging_verdict = _staging_ownership(path, staging, entry)
+    staging_verdict = _recovery_staging_ownership(path, staging, entry)
     original_verdict = _ownership(path, entry) if original_here else "missing"
     if staging_verdict == "ours" and (not original_here or original_verdict != "ours"):
         return CleanupDecision(
@@ -1451,10 +1321,10 @@ def _match_target(
         if not matches:
             matches = [path for path in tracked if path.name.startswith(text)]
     if not matches:
-        raise LookupError(f"no tracked directory matches {text!r}")
+        raise TargetError(f"no tracked directory matches {text!r}")
     if len(matches) > 1:
         names = ", ".join(sorted(path.name for path in matches))
-        raise LookupError(f"{text!r} is ambiguous; it matches: {names}")
+        raise TargetError(f"{text!r} is ambiguous; it matches: {names}")
     return matches[0]
 
 
@@ -1520,11 +1390,11 @@ _CURRENT_MISMATCH_MESSAGE = (
 )
 
 
-class _CurrentTargetNotFound(LookupError):
+class _CurrentTargetNotFound(TargetError):
     """No ``.ephemdir`` marker was found at or above the start directory."""
 
 
-class _CurrentTargetMismatch(LookupError):
+class _CurrentTargetMismatch(TargetError):
     """A marker was found but does not match an active tracked entry."""
 
 
@@ -1639,6 +1509,11 @@ def extend(
 
     ``None`` removes the time limit entirely (the restart policy still
     applies). Returns the directory's path.
+
+    Raises :class:`OSError` when the path no longer holds the directory
+    ephemdir created: such an entry can never be cleaned up automatically, so
+    a new deadline would be a promise nothing can keep. The recorded lifetime
+    is left untouched in that case.
     """
     reg = registry or Registry()
     path, snapshot = _resolve_active(target, registry=reg)
@@ -1650,6 +1525,17 @@ def extend(
             # The entry vanished or was claimed between resolve() and here
             # (e.g. a concurrent sweep); surface it instead of false success.
             raise LookupError(f"no tracked directory matches {os.fspath(target)!r}")
+        if _ownership(path, entry) == "foreign":
+            # The backend answers "foreign" both when someone else's directory
+            # occupies the path and when the path simply vanished. Name the
+            # actual case instead of accusing a deleted directory of being an
+            # impostor; the refusal itself is right either way.
+            reason = (
+                "it no longer exists"
+                if _path_state(path) == "missing"
+                else "it is not the directory ephemdir created"
+            )
+            raise OSError(f"refusing to extend {path}: {reason}")
         entry["expires_at"] = expires_at
         entry["cleanup_policy"] = CleanupPolicy.AUTO.value
     logger.info("extended %s", path)
@@ -1727,6 +1613,8 @@ def recover(
                 raise OSError(
                     f"could not fully remove {path}; the staging remainder stays tracked"
                 )
+        elif status == "completed":
+            return path
         elif status == "recovery":
             raise OSError(
                 f"{path} is still ambiguous; resolve the conflicting original/staging "
@@ -1793,7 +1681,13 @@ def dir_status(
         return "unavailable"
     ownership = _ownership(path, entry)
     if ownership == "foreign":
-        return "replaced"
+        # The backend reports a vanished path as "foreign" too, so a sweep
+        # that renames the directory to its staging name between the probe
+        # above and this call would surface as "replaced". That word is a
+        # safety signal ("someone else's directory occupies the path"), so
+        # re-probe and keep it meaningful: a path that simply disappeared is
+        # reported as missing, exactly as the next sweep will see it.
+        return "replaced" if _path_state(path) == "present" else "missing"
     if ownership == "unverified":
         return "legacy"
     if entry.get("cleanup_policy") == CleanupPolicy.NEXT_SWEEP.value:
@@ -1814,17 +1708,33 @@ def explain(
     mode: SweepMode | str = SweepMode.FULL,
 ) -> CleanupDecision:
     """Explain cleanup state for one active tracked directory."""
+    decision, _, _ = _explain_with_entry(target, registry=registry, mode=mode)
+    return decision
+
+
+def _explain_with_entry(
+    target: str | os.PathLike[str],
+    *,
+    registry: Registry | None = None,
+    mode: SweepMode | str = SweepMode.FULL,
+) -> tuple[CleanupDecision, Entry, float]:
+    """Return one decision and the exact entry/time snapshot that produced it."""
     reg = registry or Registry()
     state = reg.load(read_only=True)
     path = _match_target(target, state)
-    return _decision_for_entry(
+    entry = dict(state[str(path)])
+    evaluated_at = time.time()
+    if entry.get("state", "active") != "active":
+        return _recovery_plan_decision(path, entry), entry, evaluated_at
+    decision = _decision_for_entry(
         path,
-        state[str(path)],
-        now=time.time(),
+        entry,
+        now=evaluated_at,
         current_boot=boot_time(),
         current_boot_id=boot_session_id(),
         mode=SweepMode(mode),
     )
+    return decision, entry, evaluated_at
 
 
 def _decision_for_entry(
@@ -1847,7 +1757,7 @@ def _decision_for_entry(
     complete = True
     max_size_for_status = entry.get("max_size")
     if path_probe == "present":
-        parent_error = _deletion_guard(path)
+        parent_error = _destructive_path_error(path)
         ownership = _ownership(path, entry)
         if entry.get("keep_while_in_use") and in_use is False:
             in_use = is_in_use(path)
@@ -2045,15 +1955,15 @@ def _create_unique_dir(
     name_style: str = "secure",
     reserved: set[str] | frozenset[str] = frozenset(),
     parent_fd: int | None = None,
-) -> Path:
-    """Create a new owner-only directory absent from disk and the registry.
+) -> CreatedDirectory:
+    """Create a new owner-only marked directory absent from disk and the registry.
 
     ``reserved`` is read while the caller holds the registry lock.  This is
     essential for journal entries whose original pathname is temporarily free
-    while their owned tree lives at a private ``.deleting`` path.  When
-    ``parent_fd`` is given, the directory is created relative to that already
-    verified descriptor so an ancestor swapped mid-operation cannot redirect
-    the creation.
+    while their owned tree lives at a private ``.deleting`` path.  The name
+    loop (naming policy, registry reservations) stays here; each single
+    attempt — mkdir, marker, identity snapshot, all relative to the verified
+    ``parent_fd`` when given — is the backend's create operation.
     """
     _validate_prefix(prefix)
     if name_style not in {"clean", "secure"}:
@@ -2066,11 +1976,7 @@ def _create_unique_dir(
         if str(candidate) in reserved:
             continue
         try:
-            if parent_fd is not None:
-                os.mkdir(name, mode=0o700, dir_fd=parent_fd)
-            else:
-                candidate.mkdir(mode=0o700, parents=False, exist_ok=False)
-            return candidate
+            return _BACKEND.create_owned_directory(parent, name, parent_fd=parent_fd)
         except FileExistsError:
             continue  # Name collision: try another playful name.
     raise RuntimeError(
@@ -2122,72 +2028,19 @@ def _staging_name(path: Path) -> Path:
     return path.parent / f".{path.name}.{os.getpid()}-{uuid.uuid4().hex[:8]}.deleting"
 
 
-def _open_directory_nofollow(path: str | os.PathLike[str], *, dir_fd: int | None = None) -> int:
-    """Open a directory itself, refusing symlinks when the platform supports it."""
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    if dir_fd is None:
-        return os.open(path, flags)
-    return os.open(path, flags, dir_fd=dir_fd)
+_open_directory_nofollow = _posix_backend.open_directory_nofollow
 
 
 def _open_verified_staging(staging: Path, entry: Entry) -> int:
-    """Open ``staging`` and prove the fd still names the claimed directory."""
-    fd = _open_directory_nofollow(staging)
-    try:
-        fd_stat = os.fstat(fd)
-        if not stat.S_ISDIR(fd_stat.st_mode):
-            raise _StagingIdentityError(errno.ENOTDIR, "staging path is not a directory")
+    """Open ``staging`` and prove the fd still names the claimed directory.
 
-        inode_ok = _fd_inode_matches(fd, entry)
-        if inode_ok is False:
-            raise _StagingIdentityError(
-                errno.ESTALE,
-                f"{staging} no longer matches the claimed directory inode",
-            )
-
-        marker_id = entry.get("marker_id")
-        marker = _read_marker_at(fd)
-        if isinstance(marker_id, str):
-            # The recorded marker is the primary proof of ownership; a matching
-            # inode alone is never sufficient because inode numbers are reused
-            # the instant a tree is removed. So when a marker id is on record the
-            # marker must still be present AND match — mirroring the claim-time
-            # preflight and _staging_ownership, which already treat a missing
-            # marker as unproven. Accepting inode-only here would let a same-user
-            # race swap the staging path for a marker-less replacement that
-            # happened to inherit the recorded inode.
-            if marker != marker_id:
-                raise _StagingIdentityError(
-                    errno.ESTALE,
-                    f"{staging} no longer carries ephemdir's ownership marker",
-                )
-        elif inode_ok is None:
-            raise _StagingIdentityError(
-                errno.ESTALE,
-                f"{staging} cannot be verified without marker or inode",
-            )
-        return fd
-    except BaseException:
-        os.close(fd)
-        raise
+    Fault-injection seam for the recovery fixtures; the implementation lives
+    in the POSIX backend.
+    """
+    return _posix_backend.open_verified_staging(staging, entry)
 
 
-def _rmdir_verified_child(parent_fd: int, name: str, child_fd: int) -> None:
-    """Remove an empty child directory only while its name still matches ``child_fd``."""
-    child_stat = os.fstat(child_fd)
-    try:
-        live_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError as exc:
-        raise _StagingIdentityError(
-            errno.ESTALE,
-            f"directory entry {name!r} disappeared before removal",
-        ) from exc
-    if (live_stat.st_dev, live_stat.st_ino) != (child_stat.st_dev, child_stat.st_ino):
-        raise _StagingIdentityError(
-            errno.ESTALE,
-            f"directory entry {name!r} was replaced before removal",
-        )
-    os.rmdir(name, dir_fd=parent_fd)
+_rmdir_verified_child = _posix_backend.rmdir_verified_child
 
 
 def _linux_mount_id_statx(fd: int) -> int | None:
@@ -2223,179 +2076,21 @@ def _mount_id_for_fd(fd: int) -> int | None:
     return _linux_mount_id(fd)
 
 
-def _check_child_mount_boundary(child_fd: int, *, root_dev: int, root_mount_id: int | None) -> None:
-    """Fail closed when a child directory crosses a filesystem or mount boundary."""
-    boundary = MountBoundary(
-        root_dev=root_dev,
-        root_mount_id=root_mount_id,
-        mount_id_required=sys.platform.startswith("linux"),
-    )
-    try:
-        verify_same_mount(child_fd, boundary, mount_id_func=_mount_id_for_fd)
-    except MountBoundaryError as error:
-        if error.code == "mount-id-unavailable":
-            raise OSError(
-                errno.ENOTSUP,
-                "cannot verify Linux mount boundary while deleting staging tree",
-            ) from error
-        raise OSError(
-            errno.EXDEV,
-            "refusing to cross mount boundary while deleting staging tree",
-        ) from error
+_check_child_mount_boundary = _posix_backend.check_child_mount_boundary
+_scan_fd_names = _posix_backend.scan_fd_names
 
 
-def _scan_fd_names(dir_fd: int) -> Iterator[str]:
-    """Yield directory entry names from an fd without materializing the listing."""
-    with os.scandir(dir_fd) as entries:
-        for entry in entries:
-            yield entry.name
-
-
-def _delete_directory_contents_fd(
-    dir_fd: int,
-    *,
-    root_dev: int,
-    root_mount_id: int | None,
-) -> None:
-    """Remove directory contents relative to an fd using an explicit stack."""
-    root_stat = os.fstat(dir_fd)
-    root_id = (root_stat.st_dev, root_stat.st_ino)
-    seen = {root_id}
-    stack = [
-        _DeleteFrame(
-            fd=dir_fd,
-            names=_scan_fd_names(dir_fd),
-            parent_fd=None,
-            name=None,
-            inode=root_id,
-            close=False,
-        )
-    ]
-    try:
-        while stack:
-            frame = stack[-1]
-            current_fd = frame.fd
-            try:
-                name = next(frame.names)
-            except StopIteration:
-                stack.pop()
-                seen.discard(frame.inode)
-                try:
-                    close_method = getattr(frame.names, "close", None)
-                    if close_method is not None:
-                        close_method()
-                    if frame.parent_fd is not None and frame.name is not None:
-                        _rmdir_verified_child(frame.parent_fd, frame.name, current_fd)
-                finally:
-                    if frame.close:
-                        os.close(current_fd)
-                continue
-
-            if name in {".", ".."}:
-                continue
-            try:
-                child_stat = os.stat(name, dir_fd=current_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                continue
-
-            if stat.S_ISDIR(child_stat.st_mode):
-                child_fd = _open_directory_nofollow(name, dir_fd=current_fd)
-                pushed = False
-                try:
-                    opened_stat = os.fstat(child_fd)
-                    if (opened_stat.st_dev, opened_stat.st_ino) != (
-                        child_stat.st_dev,
-                        child_stat.st_ino,
-                    ):
-                        raise _StagingIdentityError(
-                            errno.ESTALE,
-                            f"directory entry {name!r} changed before traversal",
-                        )
-                    _check_child_mount_boundary(
-                        child_fd,
-                        root_dev=root_dev,
-                        root_mount_id=root_mount_id,
-                    )
-                    child_id = (opened_stat.st_dev, opened_stat.st_ino)
-                    if child_id in seen:
-                        raise OSError(
-                            errno.ELOOP,
-                            "refusing to recurse into a repeated directory inode",
-                        )
-                    seen.add(child_id)
-                    stack.append(
-                        _DeleteFrame(
-                            fd=child_fd,
-                            names=_scan_fd_names(child_fd),
-                            parent_fd=current_fd,
-                            name=name,
-                            inode=child_id,
-                            close=True,
-                        )
-                    )
-                    pushed = True
-                finally:
-                    if not pushed:
-                        os.close(child_fd)
-            else:
-                try:
-                    os.unlink(name, dir_fd=current_fd)
-                except FileNotFoundError:
-                    continue
-    finally:
-        while len(stack) > 1:
-            frame = stack.pop()
-            close_method = getattr(frame.names, "close", None)
-            if close_method is not None:
-                close_method()
-            if frame.close:
-                os.close(frame.fd)
-
-
-def _rmdir_verified_staging(staging: Path, staging_fd: int) -> None:
-    """Remove the empty staging directory if the pathname still names ``staging_fd``.
-
-    By this point the owned staging tree's contents have already been removed
-    through the fd-bound path, so only an empty directory remains to unlink.
-    There is no portable fd-only ``rmdir`` primitive, so the final removal is
-    necessarily by pathname and carries an accepted same-user TOCTOU window:
-    between the identity ``stat`` below and ``os.rmdir`` a racing same-user
-    process could swap an *empty* replacement (with the reused inode) into the
-    path. The risk envelope is deliberately bounded — ``rmdir`` refuses a
-    non-empty directory, a symlink, or a mountpoint, so any replacement that
-    actually holds data survives; only an empty directory the racer itself
-    created could be removed, which is not a privilege-boundary break. This
-    residual race is documented in SECURITY.md and pinned by
-    ``test_empty_staging_rmdir_cannot_remove_nonempty_replacement``.
-    """
-    fd_stat = os.fstat(staging_fd)
-    try:
-        live_stat = os.stat(staging, follow_symlinks=False)
-    except FileNotFoundError as exc:
-        raise _StagingIdentityError(
-            errno.ESTALE,
-            f"{staging} disappeared before final directory removal",
-        ) from exc
-    if (live_stat.st_dev, live_stat.st_ino) != (fd_stat.st_dev, fd_stat.st_ino):
-        raise _StagingIdentityError(
-            errno.ESTALE,
-            f"{staging} was replaced before final directory removal",
-        )
-    os.rmdir(staging)
+_delete_directory_contents_fd = _posix_backend.delete_directory_contents_fd
+_rmdir_verified_staging = _posix_backend.rmdir_verified_staging
 
 
 def _safe_delete_backend_error() -> str | None:
-    """Return why fd-bound recursive deletion is unavailable, if applicable."""
-    if os.name != "posix":
-        return "safe handle-bound recursive deletion is unavailable on this platform"
-    required_dir_fd = (os.open, os.stat, os.unlink, os.rmdir, os.rename, os.mkdir)
-    if any(function not in os.supports_dir_fd for function in required_dir_fd):
-        return "required dir_fd filesystem operations are unavailable"
-    if os.scandir not in os.supports_fd:
-        return "scandir cannot enumerate an opened directory descriptor"
-    if not getattr(os, "O_DIRECTORY", 0) or not getattr(os, "O_NOFOLLOW", 0):
-        return "safe no-follow directory opens are unavailable"
-    return None
+    """Return why fd-bound recursive deletion is unavailable, if applicable.
+
+    Capability seam for the platform fixtures; the probe lives in the POSIX
+    backend.
+    """
+    return _posix_backend.safe_delete_backend_error()
 
 
 def _preflight_claim_source(
@@ -2406,80 +2101,18 @@ def _preflight_claim_source(
     allow_unverified: bool,
 ) -> tuple[str, int | None, os.stat_result | None, int | None]:
     """Open and verify the source before any journal or pathname mutation."""
-    try:
-        source_fd = _open_directory_nofollow(path.name, dir_fd=parent_fd)
-    except (FileNotFoundError, NotADirectoryError):
-        return "foreign", None, None, None
-    except (NotImplementedError, TypeError):
-        return "unsupported", None, None, None
-    keep_open = False
-    try:
-        source_stat = os.fstat(source_fd)
-        live_stat = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
-        if not stat.S_ISDIR(source_stat.st_mode):
-            return "foreign", None, None, None
-        if (source_stat.st_dev, source_stat.st_ino) != (live_stat.st_dev, live_stat.st_ino):
-            return "changed", None, None, None
-
-        inode_ok = _fd_inode_matches(source_fd, entry)
-        marker_id = entry.get("marker_id")
-        marker = _read_marker_at(source_fd)
-        if isinstance(marker_id, str):
-            if marker != marker_id or inode_ok is False:
-                return "foreign", None, None, None
-            verified = True
-        else:
-            verified = inode_ok is True
-        if not verified and not allow_unverified:
-            return "unverified", None, None, None
-
-        root_mount_id = _mount_id_for_fd(source_fd)
-        if sys.platform.startswith("linux") and root_mount_id is None:
-            return "unsupported", None, None, None
-        keep_open = True
-        return "ready", source_fd, source_stat, root_mount_id
-    except (NotImplementedError, TypeError):
-        return "unsupported", None, None, None
-    except OSError:
-        return "locked", None, None, None
-    finally:
-        if not keep_open:
-            os.close(source_fd)
+    return _BACKEND.preflight_claim_source(
+        path, parent_fd, entry, allow_unverified=allow_unverified
+    )
 
 
 def _delete_staging_tree(staging: Path, entry: Entry) -> None:
-    """Delete a verified staging tree, binding recursion to an opened directory fd."""
-    backend_error = _safe_delete_backend_error()
-    if backend_error is not None:
-        raise OSError(errno.ENOTSUP, backend_error)
+    """Delete a verified staging tree, binding recursion to an opened directory fd.
 
-    staging_fd = _open_verified_staging(staging, entry)
-    try:
-        root_stat = os.fstat(staging_fd)
-        stored_mount_id = entry.get("mount_id")
-        root_mount_id = _mount_id_for_fd(staging_fd)
-        if sys.platform.startswith("linux") and root_mount_id is None:
-            raise OSError(
-                errno.ENOTSUP,
-                "cannot verify Linux mount boundary while deleting staging tree",
-            )
-        if (
-            isinstance(stored_mount_id, int)
-            and root_mount_id is not None
-            and stored_mount_id != root_mount_id
-        ):
-            raise _StagingIdentityError(
-                errno.ESTALE,
-                "staging directory moved to a different mount after claim",
-            )
-        _delete_directory_contents_fd(
-            staging_fd,
-            root_dev=root_stat.st_dev,
-            root_mount_id=root_mount_id,
-        )
-        _rmdir_verified_staging(staging, staging_fd)
-    finally:
-        os.close(staging_fd)
+    Fault-injection seam for the crash-window fixtures; the fd-bound deletion
+    engine lives in the POSIX backend.
+    """
+    _BACKEND.delete_claimed_tree(staging, entry)
 
 
 def _try_claim(
@@ -2565,17 +2198,7 @@ def _try_claim(
                     live.update({"state": "active", "claim_id": None, "staging_path": None})
             return "unsupported", None, None
         try:
-            os.rename(path.name, staging.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-            moved_stat = os.stat(staging.name, dir_fd=parent_fd, follow_symlinks=False)
-            source_stat = os.fstat(source_fd)
-            if (moved_stat.st_dev, moved_stat.st_ino) != (source_stat.st_dev, source_stat.st_ino):
-                raise _StagingIdentityError(
-                    errno.ESTALE, f"{staging} does not name the preflighted source directory"
-                )
-            try:
-                os.fsync(parent_fd)
-            except OSError:
-                pass
+            _BACKEND.rename_to_staging(path, staging, parent_fd, source_fd)
         except (NotImplementedError, TypeError):
             result = "unsupported"
         except OSError:
@@ -2629,8 +2252,26 @@ def _finish_deletion(registry: Registry, key: str, staging: Path, entry: Entry) 
     error: Exception | None = None
     identity_lost = False
     completed = False
+    delete_entry = dict(entry)
+
+    def mark_contents_cleared() -> None:
+        """Persist root-only phase before unlinking the ownership marker."""
+        with registry.transaction() as state:
+            live = state.get(key)
+            if live is None or live.get("claim_id") != claim_id:
+                raise _StagingIdentityError(
+                    errno.ESTALE,
+                    f"registry claim for {key} changed during deletion",
+                )
+            live["delete_phase"] = "root-only"
+        delete_entry["delete_phase"] = "root-only"
+
+    # Preserve the long-standing two-argument test seam. The backend consumes
+    # this in-memory-only callback after all payload entries are gone; it is
+    # never serialized into the registry.
+    delete_entry[_CONTENTS_CLEARED_CALLBACK_KEY] = mark_contents_cleared
     try:
-        _delete_staging_tree(staging, entry)
+        _delete_staging_tree(staging, delete_entry)
         _fsync_directory(staging.parent)
         completed = True
     except _StagingIdentityError as exc:
@@ -2701,7 +2342,7 @@ def _recover_entry(
             return "blocked", None, dict(entry)
         if lifecycle == "recovery" and not retry_recovery:
             return "recovery", None, dict(entry)
-        reason = _deletion_guard(original)
+        reason = _destructive_path_error(original)
         if reason is not None:
             entry.update({"state": "recovery", "claim_id": None})
             logger.warning("refusing journal recovery for %s: %s", original, reason)
@@ -2719,17 +2360,25 @@ def _recover_entry(
             return "busy", None, dict(entry)
         original_here = original_probe == "present"
         staging_here = staging_probe == "present"
+        root_only = entry.get("delete_phase") == "root-only"
 
+        if not original_here and not staging_here and root_only:
+            del state[key]
+            return "completed", None, dict(entry)
         if not original_here and not staging_here:
             entry.update({"state": "recovery", "claim_id": None})
             return "recovery", None, dict(entry)
 
         original_verdict = _ownership(original, entry) if original_here else "missing"
         staging_verdict = (
-            _staging_ownership(original, staging, entry)
+            _recovery_staging_ownership(original, staging, entry)
             if staging_here and staging is not None
             else "missing"
         )
+
+        if root_only and not staging_here and original_verdict == "foreign":
+            del state[key]
+            return "completed", None, dict(entry)
 
         if original_here and staging_here:
             if staging_verdict == "ours" and original_verdict != "ours":
@@ -2792,7 +2441,7 @@ def _execute_remove(
     """
     reason = _deletion_guard(path)
     if reason is not None:
-        raise OSError(f"refusing to delete {path}: {reason}")
+        raise SafetyError(f"refusing to delete {path}: {reason}")
     hint = expected or registry.load(read_only=True).get(str(path)) or {}
     with registry.deletion_lock(_deletion_lock_key(str(path), hint)) as acquired:
         if not acquired:
@@ -2820,7 +2469,7 @@ def _execute_remove(
         if status == "changed":
             raise OSError(f"refusing to delete {path}: its registry entry changed concurrently")
         if status == "unsupported":
-            raise OSError(
+            raise UnsupportedPlatformError(
                 errno.ENOTSUP,
                 f"safe recursive deletion is unavailable for {path}; original remains in place",
             )

@@ -39,7 +39,12 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from . import __version__
-from ._completion import completion_script
+from ._completion import (
+    completion_script,
+    completion_status,
+    install_completion,
+    uninstall_completion,
+)
 from ._display import (
     Painter,
     color_enabled,
@@ -67,16 +72,16 @@ from ._registry import (
     UnsafeRegistryError,
     _valid_tag,
 )
-from ._service import ServiceError, install_service, uninstall_service
+from ._service import ServiceError, install_service, service_status, uninstall_service
 from ._size import measure_tree
 from ._stats import StatsLedger
 from .core import (
     _UNSET,
     _current_target_path,
     _CurrentTargetNotFound,
+    _explain_with_entry,
     _path_state,
     dir_status,
-    explain,
     extend,
     keep,
     parse_lifetime,
@@ -362,10 +367,15 @@ def _cmd_new(args: argparse.Namespace) -> int:
 
     try:
         directory = tempdir(**kwargs)
-    except (TypeError, ValueError, OSError, LookupError) as error:
-        # Bad user input or an unwritable registry: a message, not a traceback.
+    except (TypeError, ValueError) as error:
+        # Bad user input (invalid lifetime/tag/prefix/...): usage error.
         _fail(args, error)
         return 2
+    except (OSError, LookupError) as error:
+        # Runtime failure (unusable parent, unsupported platform, registry):
+        # a message, not a traceback — and exit 1, not a usage error.
+        _fail(args, error)
+        return 1
     # The path goes to stdout so it can be captured in shell pipelines;
     # all diagnostics go to stderr via the logger.
     print(directory.path)
@@ -394,12 +404,10 @@ def _cmd_sweep(args: argparse.Namespace) -> int:
 def _cmd_explain(args: argparse.Namespace) -> int:
     try:
         target = args.target if args.target is not None else _current_target_path()
-        decision = explain(target)
+        decision, entry, now = _explain_with_entry(target)
     except LookupError as error:
         _fail(args, error)
         return 1
-    now = time.time()
-    entry = registered().get(str(decision.path), {})
     if args.json:
         emit_json(explain_payload(decision, entry, now))
         return 0
@@ -453,6 +461,77 @@ def _cmd_completion(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_completion_install(args: argparse.Namespace) -> int:
+    try:
+        message = install_completion(args.shell)
+    except (ServiceError, ValueError) as error:
+        _fail(args, error)
+        return 1
+    logger.warning("%s", message)
+    return 0
+
+
+def _cmd_completion_uninstall(args: argparse.Namespace) -> int:
+    try:
+        message = uninstall_completion(args.shell)
+    except (ServiceError, ValueError) as error:
+        _fail(args, error)
+        return 1
+    logger.warning("%s", message)
+    return 0
+
+
+def _cmd_completion_status(args: argparse.Namespace) -> int:
+    report = completion_status(args.shell)
+    if args.json:
+        emit_json(report)
+        return 0
+    for row in report:
+        print(f"{row['shell']:<6} {row['status']:<12} {row['path']}")
+    return 0
+
+
+def _cmd_service_status(args: argparse.Namespace) -> int:
+    status = service_status()
+    if args.json:
+        emit_json(status)
+        return 0
+    print(f"platform:  {status['platform']}")
+    print(f"manager:   {status['manager']}")
+    print(f"unit:      {status['unit']}")
+    print(f"installed: {status['installed']}")
+    active = status["active"]
+    print(f"active:    {'unknown' if active is None else active}")
+    files = status["files"]
+    if isinstance(files, dict):
+        for path, state in files.items():
+            print(f"file:      {state:<12} {path}")
+    environment = status["environment"]
+    if isinstance(environment, dict):
+        for key, value in sorted(environment.items()):
+            print(f"env:       {key}={value}")
+    command = status.get("command")
+    if isinstance(command, list) and command:
+        print(f"command:   {command!r}")
+    command_valid = status.get("command_valid")
+    if command_valid is not None:
+        print(f"argv-ok:   {command_valid}")
+    working_directory = status.get("working_directory")
+    if working_directory is not None:
+        print(f"cwd:       {working_directory}")
+    working_directory_valid = status.get("working_directory_valid")
+    if working_directory_valid is not None:
+        print(f"cwd-ok:    {working_directory_valid}")
+    registry_status = status.get("registry_status")
+    if registry_status is not None:
+        print(f"registry:  {registry_status}")
+    else:
+        registry_present = status["registry_present"]
+        if registry_present is not None:
+            print(f"registry:  {'present' if registry_present else 'MISSING'}")
+    return 0
+
+
 def _cmd_menu(args: argparse.Namespace) -> int:
     return run_menu(lambda argv: main(argv))
 
@@ -477,6 +556,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if args.json:
         payload = []
         for path, entry, status in rows:
+            original_state = _path_state(path)
             expires_at = entry.get("expires_at")
             # Duration fields are integer seconds in the JSON contract, matching
             # explain --json (CONTRACT.md / RC4-1).
@@ -491,8 +571,15 @@ def _cmd_list(args: argparse.Namespace) -> int:
                     "name": path.name,
                     "status": status,
                     "lifecycle_state": entry.get("state", "active"),
-                    "exists": None if status == "unavailable" else status != "missing",
-                    "original_state": _path_state(path),
+                    # One probe feeds both fields: two separate calls could
+                    # straddle a concurrent sweep and emit a row that
+                    # contradicts itself (exists true, original_state missing).
+                    "exists": (
+                        True if original_state == "present"
+                        else False if original_state == "missing"
+                        else None
+                    ),
+                    "original_state": original_state,
                     "staging_path": str(staging_path) if staging_path is not None else None,
                     "staging_state": (
                         _path_state(staging_path) if staging_path is not None else "missing"
@@ -762,7 +849,11 @@ def _cmd_extend(args: argparse.Namespace) -> int:
     try:
         resolved = target if target is not None else _current_target_path()
         path = extend(resolved, None if forever else lifetime_str)
-    except (LookupError, ValueError) as error:
+    except ValueError as error:
+        # An unparseable lifetime is a usage error, not a runtime failure.
+        _fail(args, error)
+        return 2
+    except LookupError as error:
         _fail(args, error)
         return 1
     if forever:
@@ -985,29 +1076,67 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_cmd.add_argument("--json", action="store_true", help="machine-readable output")
     doctor_cmd.set_defaults(func=_cmd_doctor)
 
-    completion = sub.add_parser("completion", help="print shell completion scripts")
+    completion = sub.add_parser("completion", help="manage shell completion scripts")
     completion_sub = completion.add_subparsers(
         dest="completion_command",
         required=True,
         parser_class=_NoAbbrevArgumentParser,
     )
-    for command, help_text in (
-        ("install", "print a completion script; does not modify shell startup files"),
-        ("show", "print a completion script"),
-    ):
-        completion_print = completion_sub.add_parser(
-            command,
-            help=help_text,
-            description=help_text,
-        )
-        completion_print.add_argument(
-            "shell",
-            nargs="?",
-            choices=["bash", "zsh", "fish", "powershell"],
-            default=_detect_shell(),
-            help="shell to target",
-        )
-        completion_print.set_defaults(func=_cmd_completion)
+    completion_show = completion_sub.add_parser(
+        "show", help="print a completion script", description="print a completion script"
+    )
+    completion_show.add_argument(
+        "shell",
+        nargs="?",
+        choices=["bash", "zsh", "fish", "powershell"],
+        default=_detect_shell(),
+        help="shell to target",
+    )
+    completion_show.set_defaults(func=_cmd_completion)
+    completion_install = completion_sub.add_parser(
+        "install",
+        help="install ephemdir's completion file for a shell",
+        description="atomically install ephemdir's own completion file to the "
+                    "per-user completion directory and record its exact digest",
+    )
+    completion_install.add_argument(
+        "shell",
+        nargs="?",
+        choices=["bash", "zsh", "fish"],
+        default=_detect_shell(),
+        help="shell to target",
+    )
+    completion_install.set_defaults(func=_cmd_completion_install)
+    completion_uninstall = completion_sub.add_parser(
+        "uninstall",
+        help="remove ephemdir's completion file for a shell",
+        description="remove the completion file only after verifying it is "
+                    "exactly the file ephemdir installed",
+    )
+    completion_uninstall.add_argument(
+        "shell",
+        nargs="?",
+        choices=["bash", "zsh", "fish"],
+        default=_detect_shell(),
+        help="shell to target",
+    )
+    completion_uninstall.set_defaults(func=_cmd_completion_uninstall)
+    completion_status_cmd = completion_sub.add_parser(
+        "status",
+        help="report completion install state (read-only)",
+        description="read-only report of the completion file for each shell",
+    )
+    completion_status_cmd.add_argument(
+        "shell",
+        nargs="?",
+        choices=["bash", "zsh", "fish"],
+        default=None,
+        help="shell to report (default: all)",
+    )
+    completion_status_cmd.add_argument(
+        "--json", action="store_true", help="machine-readable output"
+    )
+    completion_status_cmd.set_defaults(func=_cmd_completion_status)
 
     menu = sub.add_parser("menu", help="open an interactive text menu")
     menu.set_defaults(func=_cmd_menu)
@@ -1038,21 +1167,61 @@ def build_parser() -> argparse.ArgumentParser:
                             default=None, help="shell to target (default: autodetect)")
     shell_init.set_defaults(func=_cmd_shell_init)
 
+    runtime_policy_help = (
+        "runtime-trust policy for the service interpreter/package "
+        "(default: balanced on macOS, strict elsewhere; "
+        "env EPHEMDIR_SERVICE_RUNTIME_POLICY also applies)"
+    )
+
+    service = sub.add_parser("service", help="manage the scheduled sweep service")
+    service_sub = service.add_subparsers(
+        dest="service_command",
+        required=True,
+        parser_class=_NoAbbrevArgumentParser,
+    )
+    service_install = service_sub.add_parser(
+        "install", help="install a scheduled sweep service for this platform"
+    )
+    service_install.add_argument("--interval", type=int, default=600,
+                                 help="seconds between sweeps (default: 600)")
+    service_install.add_argument(
+        "--runtime-policy",
+        choices=["strict", "balanced"],
+        default=None,
+        help=runtime_policy_help,
+    )
+    service_install.set_defaults(func=_cmd_install_service)
+    service_uninstall = service_sub.add_parser(
+        "uninstall",
+        help="remove the scheduled sweep service",
+        description="stop the scheduler, then remove the service files only "
+                    "after verifying they are exactly what ephemdir installed",
+    )
+    service_uninstall.set_defaults(func=_cmd_uninstall_service)
+    service_status_cmd = service_sub.add_parser(
+        "status",
+        help="report scheduled service state (read-only)",
+        description="read-only report: installed files and their verification "
+                    "state, scheduler activity, pinned environment, registry presence",
+    )
+    service_status_cmd.add_argument(
+        "--json", action="store_true", help="machine-readable output"
+    )
+    service_status_cmd.set_defaults(func=_cmd_service_status)
+
     install = sub.add_parser("install-service",
-                             help="install a scheduled sweep service for this platform")
+                             help="alias for `service install`")
     install.add_argument("--interval", type=int, default=600,
                          help="seconds between sweeps (default: 600)")
     install.add_argument(
         "--runtime-policy",
         choices=["strict", "balanced"],
         default=None,
-        help="runtime-trust policy for the service interpreter/package "
-             "(default: balanced on macOS, strict elsewhere; "
-             "env EPHEMDIR_SERVICE_RUNTIME_POLICY also applies)",
+        help=runtime_policy_help,
     )
     install.set_defaults(func=_cmd_install_service)
 
-    uninstall = sub.add_parser("uninstall-service", help="remove the scheduled sweep service")
+    uninstall = sub.add_parser("uninstall-service", help="alias for `service uninstall`")
     uninstall.set_defaults(func=_cmd_uninstall_service)
 
     return parser
@@ -1089,6 +1258,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         _fail(args, error)
         return 1
     except (RegistryFormatError, RegistryUnavailableError) as error:
+        _fail(args, error)
+        return 1
+    except OSError as error:
+        # Expected filesystem failures follow the CLI contract instead of
+        # leaking a traceback.
         _fail(args, error)
         return 1
     return exit_code

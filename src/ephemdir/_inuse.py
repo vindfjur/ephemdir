@@ -52,8 +52,7 @@ def _lsof_in_use(path: str) -> bool | None:
         # lsof is resolved from trusted system directories.
         result = subprocess.run(  # nosec B603
             [executable, "+D", path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            capture_output=True,
             text=True,
             timeout=_PROBE_TIMEOUT_SECONDS,
             env=minimal_subprocess_env(),
@@ -63,4 +62,11 @@ def _lsof_in_use(path: str) -> bool | None:
         return None  # could not tell -- let the caller decide, do not fail open
     data_lines = [line for line in result.stdout.splitlines() if line.strip()]
     # The first line is the "COMMAND PID USER ..." header.
-    return len(data_lines) > 1
+    if len(data_lines) > 1:
+        return True
+    # A clean "no matches" result is exit 1 with no diagnostic. Any other
+    # non-zero/diagnostic result means the scan was incomplete and must not be
+    # converted into a confident "not in use" answer.
+    if result.returncode == 0 or (result.returncode == 1 and not result.stderr.strip()):
+        return False
+    return None

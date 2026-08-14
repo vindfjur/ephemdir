@@ -26,6 +26,18 @@ Managing directories later (by name, unique prefix or path)::
 
 from __future__ import annotations
 
+from ._errors import (
+    EphemdirError,
+    RegistryError,
+    SafetyError,
+    TargetError,
+    UnsupportedPlatformError,
+)
+from ._registry import (
+    CorruptRegistryError,
+    RegistryUnavailableError,
+    UnsafeRegistryError,
+)
 from .core import (
     CleanupDecision,
     CleanupPolicy,
@@ -45,7 +57,7 @@ from .core import (
     tempdir,
 )
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 __author__ = "vindfjur"
 
 __all__ = [
@@ -65,6 +77,14 @@ __all__ = [
     "CleanupPolicy",
     "SweepMode",
     "EphemeralDirectory",
+    "EphemdirError",
+    "RegistryError",
+    "RegistryUnavailableError",
+    "CorruptRegistryError",
+    "UnsafeRegistryError",
+    "UnsupportedPlatformError",
+    "SafetyError",
+    "TargetError",
     "__version__",
     "__author__",
 ]

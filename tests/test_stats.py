@@ -82,3 +82,33 @@ def test_stats_is_read_only_no_data_dir(capsys):
     assert main(["stats", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["created"] == 0
     assert not data_dir.exists()
+
+
+def test_stats_rejects_bool_negative_and_non_integer_deltas(tmp_path):
+    import pytest
+
+    ledger = StatsLedger(path=tmp_path / "stats.json")
+    with pytest.raises(TypeError):
+        ledger._record({"created": True})
+    with pytest.raises(TypeError):
+        ledger._record({"created": 1.5})  # type: ignore[dict-item]
+    with pytest.raises(ValueError):
+        ledger._record({"created": -1})
+    assert ledger.snapshot() == _zero()
+
+
+def test_stats_counter_saturates_at_signed_64_bit_max(tmp_path):
+    path = tmp_path / "stats.json"
+    maximum = (1 << 63) - 1
+    path.write_text(json.dumps({"created": maximum}), encoding="utf-8")
+
+    StatsLedger(path=path).record(created=5)
+
+    assert StatsLedger(path=path).snapshot()["created"] == maximum
+
+
+def test_stats_ignores_oversized_counter_on_read(tmp_path):
+    path = tmp_path / "stats.json"
+    path.write_text(json.dumps({"created": 1 << 80}), encoding="utf-8")
+
+    assert StatsLedger(path=path).snapshot()["created"] == 0

@@ -275,3 +275,35 @@ def test_windows_system_dir_ignores_environment(tmp_path, monkeypatch):
     assert env["SystemRoot"] == str(real_system.parent)
     assert env["WINDIR"] == str(real_system.parent)
     assert str(fake_root) not in env["PATH"]
+
+
+def test_relative_xdg_roots_are_ignored(tmp_path, monkeypatch):
+    from ephemdir import _platform
+    from ephemdir._platform import user_config_dir, user_data_dir
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    # The XDG branch only exists on non-darwin POSIX; pin the platform so the
+    # regression runs identically on the macOS and Linux legs of the matrix.
+    monkeypatch.setattr(_platform.sys, "platform", "linux")
+    monkeypatch.delenv("EPHEMDIR_DATA_DIR", raising=False)
+    monkeypatch.delenv("EPHEMDIR_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("XDG_DATA_HOME", "relative-data")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "relative-config")
+
+    assert user_data_dir(create=False) == home / ".local" / "share" / "ephemdir"
+    assert user_config_dir(create=False) == home / ".config" / "ephemdir"
+
+
+def test_relative_ephemdir_overrides_are_stable_under_home(tmp_path, monkeypatch):
+    from ephemdir._platform import user_config_dir, user_data_dir
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setenv("EPHEMDIR_DATA_DIR", "state/data")
+    monkeypatch.setenv("EPHEMDIR_CONFIG_DIR", "state/config")
+
+    assert user_data_dir(create=False) == home / "state" / "data"
+    assert user_config_dir(create=False) == home / "state" / "config"

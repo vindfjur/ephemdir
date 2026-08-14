@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-The supported release line is `0.7.x` (with `0.6.x` still receiving security
+The supported release line is `0.8.x` (with `0.7.x` still receiving security
 fixes). Supported runtimes are Python 3.10+ on Linux and macOS. Windows is not
 supported until a handle-bound recursive deletion backend is available.
 
@@ -39,7 +39,12 @@ original pathname and active entry stay untouched rather than being moved or
 deleted by pathname. A missing active path is not treated as proof that cleanup
 succeeded: the entry remains tracked and blocked until ephemdir verifies a
 deletion, or until the user explicitly forgets it with `prune`, `keep` or
-`recover --forget` for recovery entries. Registry reads and writes are bounded to 1 MiB, use a versioned
+`recover --forget` for recovery entries. During recursive deletion the ownership
+marker is preserved until every payload entry is gone and a durable
+`delete_phase=root-only` journal update succeeds. A crash after that point may
+leave an empty markerless staging root; recovery removes only that verified
+empty root and refuses it if any unexpected entry appeared. Registry reads and
+writes are bounded to 1 MiB, use a versioned
 envelope (schema v3, which adds optional per-directory `tags` and `description`)
 on write, and use non-blocking no-follow opens, preventing FIFOs and other
 special files from stalling commands or the scheduled sweeper. An older on-disk
@@ -71,7 +76,30 @@ file or startup hook are always rejected, under every policy.
 It also pins the verified effective `EPHEMDIR_DATA_DIR` and
 `EPHEMDIR_CONFIG_DIR` into the installed launchd/systemd definition so the
 scheduled sweep does not drift to a different registry after logout/login or
-shell environment changes.
+shell environment changes. Those locations must be reboot-persistent: service
+installation refuses macOS per-user temporary roots, common volatile runtime
+roots, and any location nested inside a marked ephemdir tree. The service establishes a valid `registry.json` at install time and sets
+fail-closed environment guards; if either the state root or that registry file
+later vanishes, the sweep aborts instead of creating fresh empty state and
+orphaning still-existing managed directories.
+
+Files ephemdir installs (service definitions and shell completions) are
+recorded with their exact SHA-256 in an owner-only manifest. Uninstalling
+never unlinks by pathname alone: the target is re-opened without following
+symlinks, must still be a regular owner-owned file that is not group/other
+writable, its bytes must match the recorded digest, and the unlink happens
+relative to the verified directory descriptor after an identity recheck. A
+modified, foreign or unrecorded file is refused with instructions rather than
+deleted. The manifest itself and its permanent lock must be regular,
+owner-owned and owner-only; all read-modify-write updates run under the OS lock,
+so concurrent installers cannot silently lose tracking records. Status treats
+unsafe parent/file permissions and registry symlinks as unsafe rather than
+reporting them as installed/present.
+
+On macOS, new entries record the kernel boot-session UUID. Existing registry
+entries without that field continue to use the stored high-resolution boot time,
+with a narrow comparison tolerance, so upgrades preserve restart cleanup and a
+fast reboot is not folded into the previous session.
 
 What it does **not** do is recursively vet every module those hooks or runtime
 dependencies may import: a `.pth` line may run an arbitrary `import`, and

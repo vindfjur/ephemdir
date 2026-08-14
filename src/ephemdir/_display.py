@@ -247,6 +247,10 @@ def explain_payload(decision: CleanupDecision, entry: Entry, now: float) -> dict
         "reasons": list(decision.reasons),
         "blocked_by": list(decision.blockers),
         "decision": checks,
+        # Cleanup triggers a caller cannot infer from `remaining_seconds`
+        # alone; `list --json` has always carried both spellings.
+        "remove_on_restart": bool(entry.get("remove_on_restart")),
+        "keep_while_in_use": bool(entry.get("keep_while_in_use")),
         "tags": _entry_tags(entry),
         "description": _entry_description(entry),
     }
@@ -267,6 +271,7 @@ def explain_trace(
     bullet = "[*]" if ascii_only else "▸"
 
     remaining = _seconds_left(entry, now)
+    restart_scoped = bool(entry.get("remove_on_restart"))
     if decision.due and decision.destructive_allowed:
         headline = paint("will be removed on the next sweep", "yellow")
     elif decision.due:
@@ -275,6 +280,11 @@ def explain_trace(
         headline = paint(f"kept for now ({format_duration(remaining)} left)", "green")
     elif remaining is not None:
         headline = paint(f"overdue by {format_duration(-remaining)}", "yellow")
+    elif restart_scoped:
+        # No lifetime, but the restart trigger still applies: saying "kept"
+        # here would contradict `list` (which shows "until restart") and read
+        # as "this directory is permanent", which it is not.
+        headline = paint("kept until the next restart", "cyan")
     else:
         headline = paint("kept (no time limit)", "green")
 
@@ -305,6 +315,10 @@ def explain_trace(
             lines.append(f"  {paint(tick, 'green')} lifetime: {format_duration(remaining)} left")
         elif remaining is None:
             lines.append(f"  {paint(tick, 'green')} lifetime: no time limit")
+        if restart_scoped:
+            lines.append(f"  {paint(bullet, 'cyan')} removed when the machine restarts")
+        if entry.get("keep_while_in_use"):
+            lines.append(f"  {paint(bullet, 'cyan')} held back while any process uses it")
         if not decision.blockers:
             lines.append(f"  {paint(tick, 'green')} ownership and identity verified")
     return "\n".join(lines)

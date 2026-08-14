@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=78.1.1"]
+requires = ["setuptools>=83.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ephemdir"
-version = "0.7.0"
+version = "0.8.0"
 description = "Create self-cleaning ephemeral directories that vanish after a lifetime or on restart."
 readme = "README.md"
 requires-python = ">=3.10"

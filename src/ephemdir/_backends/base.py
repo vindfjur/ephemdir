@@ -1,10 +1,20 @@
-"""Backend protocol and shared data structures."""
+"""Backend protocol and shared data structures.
+
+The protocol mirrors the real seam between :mod:`ephemdir.core` and a
+filesystem backend (APA-BE-002): the backend owns the syscall clusters for
+create / ownership probe / claim (preflight + rename) / delete, while core
+keeps registry transactions, the decision policy and sequencing. Claim is
+therefore two backend calls — ``preflight_claim_source`` before the journal
+intent is written and ``rename_to_staging`` after — because the journal write
+between them is core's job, not the backend's.
+"""
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 from ephemdir._registry import Entry
 from ephemdir._size import SizeResult
@@ -14,10 +24,8 @@ __all__ = [
     "ParentValidation",
     "CreatedDirectory",
     "OwnershipProbe",
-    "ClaimedDirectory",
-    "DeleteBudget",
+    "ClaimPreflight",
     "ScanBudget",
-    "DeleteResult",
     "DeletionBackend",
 ]
 
@@ -39,7 +47,8 @@ class ParentValidation:
 class CreatedDirectory:
     path: Path
     marker_id: str
-    identity: dict[str, object]
+    dev: int
+    ino: int
 
 
 @dataclass(frozen=True)
@@ -48,27 +57,21 @@ class OwnershipProbe:
     reason: str | None = None
 
 
-@dataclass(frozen=True)
-class ClaimedDirectory:
-    original: Path
-    staging: Path
-    identity: dict[str, object]
+class ClaimPreflight(NamedTuple):
+    """Verified-source handle for a claim, or the refusal status.
 
+    A ``NamedTuple`` so existing 4-tuple unpacking in core stays valid.
+    """
 
-@dataclass(frozen=True)
-class DeleteBudget:
-    max_entries: int | None = None
+    status: str
+    source_fd: int | None
+    source_stat: os.stat_result | None
+    root_mount_id: int | None
 
 
 @dataclass(frozen=True)
 class ScanBudget:
     max_entries: int | None = None
-
-
-@dataclass(frozen=True)
-class DeleteResult:
-    removed: bool
-    error: str | None = None
 
 
 class DeletionBackend(Protocol):
@@ -82,18 +85,31 @@ class DeletionBackend(Protocol):
         self,
         parent: Path,
         name: str,
-        marker_id: str,
+        marker_id: str | None = None,
+        *,
+        parent_fd: int | None = None,
     ) -> CreatedDirectory: ...
 
     def probe_ownership(self, path: Path, entry: Entry) -> OwnershipProbe: ...
 
-    def claim(self, path: Path, entry: Entry, staging_name: str) -> ClaimedDirectory: ...
-
-    def delete_claimed_tree(
+    def preflight_claim_source(
         self,
-        claimed: ClaimedDirectory,
-        budget: DeleteBudget,
-    ) -> DeleteResult: ...
+        path: Path,
+        parent_fd: int,
+        entry: Entry,
+        *,
+        allow_unverified: bool,
+    ) -> ClaimPreflight: ...
+
+    def rename_to_staging(
+        self,
+        path: Path,
+        staging: Path,
+        parent_fd: int,
+        source_fd: int,
+    ) -> None: ...
+
+    def delete_claimed_tree(self, staging: Path, entry: Entry) -> None: ...
 
     def measure_tree(
         self,

@@ -461,9 +461,34 @@ def test_explain_unknown_target_fails(capsys):
     assert "no tracked directory" in capsys.readouterr().err
 
 
-def test_completion_install(capsys):
+def test_completion_install_status_uninstall_roundtrip(capsys):
+    target = (
+        Path(os.environ["XDG_CONFIG_HOME"]) / "fish" / "completions" / "ephemdir.fish"
+    )
     assert main(["completion", "install", "fish"]) == 0
-    assert "complete -c ephemdir" in capsys.readouterr().out
+    assert target.is_file()
+    assert "complete -c ephemdir" in target.read_text(encoding="utf-8")
+
+    assert main(["completion", "status", "fish", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report == [{"shell": "fish", "path": str(target), "status": "installed"}]
+
+    assert main(["completion", "uninstall", "fish"]) == 0
+    assert not target.exists()
+    assert main(["completion", "status", "fish", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report[0]["status"] == "not-installed"
+
+
+def test_completion_uninstall_refuses_modified_file(capsys):
+    target = (
+        Path(os.environ["XDG_CONFIG_HOME"]) / "fish" / "completions" / "ephemdir.fish"
+    )
+    assert main(["completion", "install", "fish"]) == 0
+    target.write_text("edited by hand\n", encoding="utf-8")
+
+    assert main(["completion", "uninstall", "fish"]) == 1
+    assert target.is_file()  # the modified file must survive the refusal
 
 
 def test_completion_show_alias(capsys):
@@ -474,7 +499,7 @@ def test_completion_show_alias(capsys):
 def test_completion_install_help_is_explicit(capsys):
     with pytest.raises(SystemExit):
         main(["completion", "install", "--help"])
-    assert "does not modify shell startup files" in capsys.readouterr().out
+    assert "record" in capsys.readouterr().out
 
 
 def test_completion_requires_subcommand():

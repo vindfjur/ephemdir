@@ -158,6 +158,15 @@ removed by the next sweep that can verify it is still the directory ephemdir
 created. Install the scheduled service if you want that sweep to happen
 automatically after login/reboot rather than only when you run ephemdir.
 
+A lifetime is a **deadline, not a timer**: nothing runs while the machine is
+asleep or powered off, so a directory is removed by the first sweep after it
+expires, not at the instant it expires. With the scheduled service on a laptop
+that means the interval you chose plus however long the machine was asleep — a
+directory that expires overnight is typically removed shortly after you wake
+the machine the next morning. Deletion is never early, only later than the
+deadline. Use `--until-sweep` when "the next sweep" is the semantics you
+actually want, or run `ephemdir sweep` by hand to force the issue.
+
 Use `ephemdir sweep --dry-run` to preview due directories without destructive
 actions, and `ephemdir explain <name>` to see the reasons and blockers for one
 tracked directory.
@@ -240,12 +249,35 @@ To clean up reliably over time (and right after a reboot), install a scheduled
 sweep service for your platform — one command, no manual unit files:
 
 ```bash
-ephemdir install-service --interval 600   # launchd / systemd
-ephemdir uninstall-service
+ephemdir service install --interval 600   # launchd / systemd
+ephemdir service status                   # read-only report
+ephemdir service uninstall
 ```
 
-`install-service` validates the persistent runtime before writing anything:
-every component of the interpreter and package paths must be owned by you
+(`install-service` and `uninstall-service` remain as aliases.) Every file the
+installer writes — the LaunchAgent plist or the systemd units, and installed
+shell completions — is recorded with its exact SHA-256 in an owner-only
+manifest under the config directory. `service uninstall` first proves the
+scheduler is stopped, then removes each file only if it is still a regular,
+owner-owned, group/other-unwritable file whose bytes match that record,
+unlinking fd-relative after an identity recheck. A modified, foreign or
+unrecorded file is left in place with instructions instead of being deleted;
+files installed by ephemdir older than 0.8.0 are unrecorded, so reinstall
+once before uninstalling, or remove them manually. `service status` reports
+the installed files' verification state (including unsafe permissions or
+parents), the scheduler's own view, the pinned argv/working directory and
+environment, and a no-follow safety state for the pinned registry file —
+without creating or changing anything. Manifest updates are serialized by an
+owner-only OS lock so concurrent installs cannot lose digest records.
+
+`service install` validates the persistent runtime and persistent state
+locations before writing anything. The data/config directories may not live
+under macOS per-user `TMPDIR`, another volatile runtime root, or inside a
+tracked ephemdir directory. The installed job establishes the registry at install time and refuses to
+recreate a vanished state root or registry file as empty state, so a reboot
+cannot silently orphan directories that still exist on disk.
+
+Every component of the interpreter and package paths must be owned by you
 (or root). It always rejects a **world-writable** component (including sticky
 directories like `/tmp`, so a virtualenv under `/tmp` cannot host the scheduled
 service), a **foreign-owned** component, a symlinked package subdirectory, and
@@ -342,7 +374,9 @@ These apply to any option you do not pass explicitly to `tempdir()` or the
 
 The environment variables `EPHEMDIR_DATA_DIR` (registry location) and
 `EPHEMDIR_CONFIG_DIR` (config location) override the platform defaults —
-handy for sandboxes, tests and dotfile-managed setups.
+handy for sandboxes, tests and dotfile-managed setups. Absolute paths are
+recommended; a relative override is anchored under the home directory so the
+selected registry/config location cannot change merely because the CWD did.
 
 ## Command-line interface
 
@@ -369,8 +403,13 @@ ephemdir prune                   # explicitly forget missing tracked entries
 ephemdir recover brave-otter     # retry an interrupted deletion
 ephemdir recover brave-otter --forget  # forget it without deleting files
 ephemdir watch                   # sweep periodically in the foreground
-ephemdir install-service         # schedule sweeps via the OS scheduler
-ephemdir uninstall-service       # remove the scheduled service
+ephemdir service install         # schedule sweeps via the OS scheduler
+ephemdir service status          # read-only service report
+ephemdir service uninstall       # verified removal of the scheduled service
+ephemdir completion install      # install shell completion (bash/zsh/fish)
+ephemdir completion status       # read-only completion report
+ephemdir completion uninstall    # verified removal of the completion file
+ephemdir completion show zsh     # print a completion script instead
 ```
 
 Every command that takes a directory accepts a full path, the exact name or a
@@ -509,9 +548,9 @@ pytest
 
 ## Reproducible source builds
 
-`pyproject.toml` only declares the minimum safe build backend
-(`setuptools>=78.1.1`, which includes the fix for CVE-2025-47273), so a plain
-isolated build resolves whatever backend version is current. To build exactly
+`pyproject.toml` declares the minimum safe build backend
+(`setuptools>=83.0.0`, covering CVE-2025-47273 and CVE-2026-59890), so a plain
+isolated build resolves that version or newer. To build exactly
 what release CI builds, use the hash-pinned toolchain:
 
 ```bash
