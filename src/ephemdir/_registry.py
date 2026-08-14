@@ -36,6 +36,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from ._errors import RegistryError
 from ._platform import user_data_dir
 from ._security import ensure_private_directory, open_private_directory
 
@@ -51,9 +52,11 @@ __all__ = [
 
 logger = logging.getLogger("ephemdir")
 _OS_REPLACE = os.replace
+_REQUIRE_EXISTING_STATE_ENV = "EPHEMDIR_REQUIRE_EXISTING_STATE_DIR"
+_REQUIRE_EXISTING_REGISTRY_ENV = "EPHEMDIR_REQUIRE_EXISTING_REGISTRY"
 
 
-class UnsafeRegistryError(RuntimeError):
+class UnsafeRegistryError(RegistryError):
     """Raised when the registry cannot be trusted and must not be acted upon.
 
     An untrusted registry -- one that other local users could have written to
@@ -63,7 +66,7 @@ class UnsafeRegistryError(RuntimeError):
     """
 
 
-class RegistryFormatError(RuntimeError):
+class RegistryFormatError(RegistryError):
     """Raised when registry content is syntactically valid but unsupported."""
 
 
@@ -75,7 +78,7 @@ class RegistryTooLargeError(RegistryFormatError):
     """Raised when a registry exceeds ephemdir's bounded read/write limits."""
 
 
-class RegistryUnavailableError(RuntimeError):
+class RegistryUnavailableError(RegistryError):
     """Raised when the registry object cannot be read safely right now."""
 
 
@@ -128,6 +131,7 @@ _FIELD_TYPES: dict[str, tuple[type, ...]] = {
     "platform": (str,),
     "tags": (list,),
     "description": (str, type(None)),
+    "delete_phase": (str,),
 }
 
 # Numeric fields must be finite: JSON like ``1e999`` parses to infinity and
@@ -138,6 +142,7 @@ _NUMERIC_FIELDS = ("created_at", "expires_at", "boot_time")
 _VALID_STATES = frozenset({"active", "moving", "deleting", "recovery"})
 _VALID_CLEANUP_POLICIES = frozenset({"auto", "next-sweep"})
 _VALID_NAME_STYLES = frozenset({"auto", "clean", "secure"})
+_VALID_DELETE_PHASES = frozenset({"root-only"})
 
 # Fields every entry must carry; a bare ``{}`` (or anything hand-crafted
 # without the basics) is rejected outright.
@@ -344,6 +349,8 @@ def _valid_entry(key: str, entry: object) -> bool:
             return False
         if field == "name_style" and value not in _VALID_NAME_STYLES:
             return False
+        if field == "delete_phase" and value not in _VALID_DELETE_PHASES:
+            return False
         if field == "tags" and isinstance(value, list):
             if len(value) > _MAX_TAGS_PER_ENTRY:
                 return False
@@ -365,10 +372,14 @@ def _valid_entry(key: str, entry: object) -> bool:
         return False
     staging_path = entry.get("staging_path")
     if state == "active":
-        if claim_id is not None or staging_path is not None:
+        if claim_id is not None or staging_path is not None or "delete_phase" in entry:
             return False
     elif state == "moving":
-        if claim_id is None or not _valid_staging_reference(key, staging_path):
+        if (
+            claim_id is None
+            or not _valid_staging_reference(key, staging_path)
+            or "delete_phase" in entry
+        ):
             return False
     elif state == "deleting":
         if not _valid_staging_reference(key, staging_path):
@@ -376,6 +387,15 @@ def _valid_entry(key: str, entry: object) -> bool:
         if not isinstance(entry.get("dev"), int) or not isinstance(entry.get("ino"), int):
             return False
     elif state == "recovery" and claim_id is not None:
+        return False
+    if "delete_phase" in entry and (
+        not _valid_staging_reference(key, staging_path)
+        or not isinstance(entry.get("dev"), int)
+        or not isinstance(entry.get("ino"), int)
+    ):
+        # The root-only phase authorizes removing a markerless staging root,
+        # so it may never exist without the identity that proves which root:
+        # a key-derived staging path plus the recorded dev/ino (EPH-AUD-011).
         return False
     return True
 
@@ -514,7 +534,19 @@ class Registry:
 
     def _open_state_dir(self, *, create: bool) -> int:
         """Open the state directory that owns registry support files."""
-        return open_private_directory(self.path.parent, create=create)
+        require_existing = os.environ.get(_REQUIRE_EXISTING_STATE_ENV) == "1"
+        try:
+            return open_private_directory(
+                self.path.parent,
+                create=create and not require_existing,
+            )
+        except FileNotFoundError as error:
+            if require_existing:
+                raise RegistryUnavailableError(
+                    "scheduled ephemdir state directory disappeared; refusing to "
+                    f"recreate an empty registry at {self.path.parent}"
+                ) from error
+            raise
 
     def load(
         self,
@@ -593,7 +625,12 @@ class Registry:
                         raw.decode("utf-8"),
                         parse_constant=_reject_json_constant,
                     )
-            except FileNotFoundError:
+            except FileNotFoundError as error:
+                if os.environ.get(_REQUIRE_EXISTING_REGISTRY_ENV) == "1":
+                    raise RegistryUnavailableError(
+                        "scheduled ephemdir registry disappeared; refusing to "
+                        f"continue with an empty registry at {self.path}"
+                    ) from error
                 return {}
             except RegistryFormatError as error:
                 logger.warning("could not safely use registry %s: %s", self.path, error)

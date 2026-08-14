@@ -9,10 +9,8 @@ from ephemdir._size import SizeResult, measure_tree
 
 from .base import (
     BackendCapabilities,
-    ClaimedDirectory,
+    ClaimPreflight,
     CreatedDirectory,
-    DeleteBudget,
-    DeleteResult,
     OwnershipProbe,
     ParentValidation,
     ScanBudget,
@@ -37,22 +35,36 @@ class WindowsBackend:
         self,
         parent: Path,
         name: str,
-        marker_id: str,
+        marker_id: str | None = None,
+        *,
+        parent_fd: int | None = None,
     ) -> CreatedDirectory:
         raise NotImplementedError("Windows creation backend is not enabled")
 
     def probe_ownership(self, path: Path, entry: Entry) -> OwnershipProbe:
         return OwnershipProbe("unsupported", "Windows ownership probing is not enabled")
 
-    def claim(self, path: Path, entry: Entry, staging_name: str) -> ClaimedDirectory:
+    def preflight_claim_source(
+        self,
+        path: Path,
+        parent_fd: int,
+        entry: Entry,
+        *,
+        allow_unverified: bool,
+    ) -> ClaimPreflight:
         raise NotImplementedError("Windows claim backend is not enabled")
 
-    def delete_claimed_tree(
+    def rename_to_staging(
         self,
-        claimed: ClaimedDirectory,
-        budget: DeleteBudget,
-    ) -> DeleteResult:
-        return DeleteResult(False, "Windows deletion backend is not enabled")
+        path: Path,
+        staging: Path,
+        parent_fd: int,
+        source_fd: int,
+    ) -> None:
+        raise NotImplementedError("Windows claim backend is not enabled")
+
+    def delete_claimed_tree(self, staging: Path, entry: Entry) -> None:
+        raise NotImplementedError("Windows deletion backend is not enabled")
 
     def measure_tree(
         self,

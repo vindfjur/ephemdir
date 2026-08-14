@@ -135,10 +135,14 @@ def _restarted(
     same_boot_func: Callable[[float | None, float | None], bool] | None,
 ) -> bool:
     created_id = entry.get("boot_id")
-    if current_boot_id is not None:
-        return isinstance(created_id, str) and created_id != current_boot_id
+    if current_boot_id is not None and isinstance(created_id, str):
+        return created_id != current_boot_id
     if isinstance(created_id, str):
         return False
+    # Existing macOS registries predate boot-session UUID storage. Preserve
+    # restart cleanup for those entries by comparing their recorded boot time
+    # even when the current host can now provide a UUID. Other platforms stay
+    # fail-closed because their wall-clock-derived fallback is less reliable.
     if sys.platform == "darwin" and same_boot_func is not None:
         created_boot = entry.get("boot_time")
         created_boot = created_boot if isinstance(created_boot, (int, float)) else None

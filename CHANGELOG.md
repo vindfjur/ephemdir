@@ -4,6 +4,123 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-08-14
+
+0.8.0 is the final release of the 0.x line: the next release is 1.0.0, and no
+0.8.1 or 0.9.0 is planned. It stabilises contracts rather than adding features.
+
+### Added
+- A `service install|uninstall|status` command namespace (the historical
+  `install-service`/`uninstall-service` spellings remain as aliases).
+  `service status` is a strictly read-only report of the installed files and
+  their verification state, the scheduler's own view, pinned argv/cwd and
+  environment, and the no-follow safety state of the pinned registry;
+  `--json` gives the machine-readable form.
+- Real shell-completion management: `completion install` atomically writes
+  ephemdir's own completion file to the per-user location for bash, zsh or
+  fish, `completion uninstall` removes it only after verification, and
+  `completion status [--json]` reports each shell without touching anything.
+  `completion show` still prints the script.
+- A public exception hierarchy rooted at `EphemdirError`. `RegistryError` (base
+  of the existing `RegistryUnavailableError`, `CorruptRegistryError` and
+  `UnsafeRegistryError`), `TargetError` (a `LookupError` raised when a directory
+  target is not found or ambiguous), `UnsupportedPlatformError` and
+  `SafetyError` (both `OSError`s, raised for platform refusals and
+  deletion-guard refusals). Existing `except LookupError` / `except OSError` /
+  `except RuntimeError` handlers keep working unchanged — the new classes only
+  add a common, catchable root.
+
+### Changed
+- `explain` no longer describes a restart-scoped directory as "kept": an entry
+  with no lifetime that is removed on restart now reads "kept until the next
+  restart" and lists the restart trigger (and the in-use hold, when set)
+  explicitly, matching what `list` has always shown. `explain --json` gained
+  `remove_on_restart` and `keep_while_in_use`, so a `null` `remaining_seconds`
+  can no longer be mistaken for "permanent".
+- A directory that vanishes while it is being inspected is reported as
+  `missing` instead of `replaced`. The ownership probe classifies an absent
+  path the same as a foreign one, so a sweep renaming a directory to its
+  staging name mid-inspection could make `list` claim another directory had
+  taken over the path. Within one `list --json` row `exists` and
+  `original_state` are now derived from a single probe and can no longer
+  contradict each other.
+- Documented that lifetimes are deadlines rather than timers: nothing runs
+  while the machine is asleep, so removal happens at the first sweep after
+  expiry — never early, possibly much later.
+- Installed-file manifest updates are serialized by a permanent owner-only OS
+  lock, unsafe manifest permissions fail closed, dangling service symlinks are
+  refused rather than reported absent, relative XDG roots are ignored per the
+  XDG specification, and relative `EPHEMDIR_*_DIR` overrides are anchored under
+  the home directory so registry/manifest paths cannot drift with the CWD.
+- macOS restart detection now records the kernel boot-session UUID and retains
+  a precise `kern.boottime` fallback for registries created before boot UUIDs
+  were stored. A fast reboot can no longer be mistaken for the same boot.
+- Scheduled services pin only reboot-persistent state directories. Installation
+  refuses state under macOS per-user `TMPDIR`/other volatile roots or inside a
+  marked ephemdir tree, and the scheduled process fails closed if either the state root or the
+  established `registry.json` disappears, instead of recreating empty state.
+- Interrupted deletion now has a durable `root-only` phase: payload removal is
+  committed before the ownership marker is unlinked. Recovery can finish an
+  empty markerless staging root after a crash/reboot while still refusing any
+  root that gained unexpected content. The markerless phase additionally
+  requires the recorded inode identity to verify at the backend boundary, and
+  the registry refuses to store the phase at all without a key-derived staging
+  path and recorded `dev`/`ino`.
+- `plan_sweep`, `sweep --dry-run`, `explain` and the real claim path now share
+  the same parent-trust blocker; unsafe parents are no longer reported as
+  destructively allowed in previews.
+- Stats deltas reject booleans, negative and non-integer values; counters
+  saturate at the signed 64-bit maximum instead of accepting unbounded data.
+- Uninstalling the service (and installed completions) now verifies exact
+  ownership and content before unlinking: every installed file's SHA-256 is
+  recorded in an owner-only manifest at install time, and removal re-opens the
+  target no-follow, requires a regular owner-owned file that is not
+  group/other writable with bytes matching the record, re-checks the
+  directory-entry identity against the open descriptor and unlinks
+  fd-relative. Modified, foreign or unrecorded files (including service files
+  installed by ephemdir older than 0.8.0) are refused with instructions
+  instead of deleted.
+- Internal: the POSIX filesystem engine (owner-only creation with the
+  ownership marker, the marker/inode ownership probe, the claim preflight and
+  fd-relative rename, and the fd-bound recursive deletion) now lives in a
+  single backend module, `ephemdir._backends.posix`. This is the one POSIX
+  backend path planned for 0.8.0; observable behaviour is unchanged and is
+  pinned by a golden fixture suite captured before the move.
+
+### Fixed
+- `keep_while_in_use` could delete a directory that was still in use. The
+  in-use probe treated an `lsof` run that failed or could not walk the whole
+  subtree — no output rows, a diagnostic on stderr — the same as a run that
+  proved the directory free, and returned a confident "not in use". An
+  incomplete scan is now reported as "could not tell", which defers the
+  deletion; only a clean, complete `lsof` run can answer "free".
+- `extend` no longer reports success for a directory that was deleted and
+  replaced behind ephemdir's back. Such an entry can never be cleaned up
+  automatically, so the new deadline was meaningless; it is now refused with
+  `OSError` and the recorded lifetime is left untouched.
+- `list --json` reported `exists: true` for entries whose directory had already
+  been renamed for deletion (`deleting`/`recovery`). Both `exists` and
+  `original_state` now describe the original path, probed once; the tree is
+  located by `staging_path`.
+- `explain` read its verdict and the metadata printed beside it with two
+  separate registry loads, so a concurrent `extend`, `keep` or sweep could
+  produce output whose deadline contradicted its own reasons. Both now come
+  from a single snapshot.
+- Expected filesystem failures (out of space, read-only filesystem, I/O error)
+  reached the terminal as a traceback for commands without a specific handler.
+  They now follow the documented CLI error contract: one
+  `ephemdir: <command>: <reason>` line and exit code 1.
+- Uninstalling the systemd timer treated a *failing* `systemctl show` whose
+  stdout happened to read `inactive` as proof that the timer was stopped. The
+  query must now succeed before any unit file is removed.
+
+### Security
+- The pinned release toolchain moves to `setuptools` 83.0.0
+  (PYSEC-2026-3447 / CVE-2026-59890, where NFD filenames on APFS/HFS+ can
+  bypass NFC `exclude`/`prune` rules when building an sdist). ephemdir's
+  `MANIFEST.in` uses no exclude/prune directives, so no published artifact was
+  affected; the build dependency is updated regardless.
+
 ## [0.7.0] - 2026-07-01
 
 ### Added

@@ -1,7 +1,9 @@
 """Regression tests for lsof output parsing in the in-use probe.
 
 lsof exits non-zero with ``+D`` even when it finds open files, so detection must
-be based on the output, not the return code.
+be based on the output, not the return code. The return code and stderr still
+decide the *absence* case: only a clean exit-1-with-no-diagnostic run proves the
+directory is free, anything else means the scan was incomplete.
 """
 
 from __future__ import annotations
@@ -33,6 +35,25 @@ def test_no_open_files_reported(monkeypatch):
     monkeypatch.setattr(_inuse, "resolve_system_executable", lambda name: "/usr/bin/lsof")
     monkeypatch.setattr(subprocess, "run", _fake_run("", 1))
     assert _inuse._lsof_in_use("/tmp/d") is False
+
+
+def test_incomplete_scan_reports_unknown_not_free(monkeypatch):
+    # AUD-001, in the exact shape the real tool produces: macOS lsof 4.91 exits
+    # 1 with no rows and a diagnostic on stderr when it cannot walk the subtree
+    # ("lsof: WARNING: can't opendir(...): Permission denied"). Identical to a
+    # genuinely empty result apart from stderr, which is why stderr is read.
+    monkeypatch.setattr(_inuse, "resolve_system_executable", lambda name: "/usr/bin/lsof")
+
+    def _run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args,
+            1,
+            stdout="",
+            stderr="lsof: WARNING: can't opendir(/private/var/root): Permission denied\n",
+        )
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    assert _inuse._lsof_in_use("/tmp/d") is None
 
 
 def test_missing_lsof_reports_unknown(monkeypatch):

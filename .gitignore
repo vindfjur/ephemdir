@@ -23,3 +23,9 @@ env/
 .vscode/
 .idea/
 .DS_Store
+
+# Working notes: release planning, audit correspondence and manual checklists.
+# Never part of a release — kept out of the index so `git add -A` cannot
+# publish them by accident.
+tmp/
+docs/

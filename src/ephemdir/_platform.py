@@ -17,11 +17,12 @@ from ._trusted_exec import minimal_subprocess_env, resolve_system_executable, st
 
 __all__ = ["user_data_dir", "user_config_dir", "boot_time", "boot_session_id", "same_boot"]
 
-# Two boot-time readings within this many seconds are treated as the same boot.
-# Boot time derived from uptime shifts when the wall clock is stepped (NTP,
-# manual changes), so the tolerance is generous; on Linux the stable
-# kernel boot_id is preferred and this fallback rarely decides anything.
+# Two boot-time readings within this many seconds are treated as the same boot
+# on platforms where the value is derived from uptime. macOS is different:
+# ``kern.boottime`` is an exact kernel-stored timestamp, so using the generous
+# fallback tolerance there can miss a real fast reboot.
 _BOOT_TOLERANCE_SECONDS = 120.0
+_MACOS_BOOT_TOLERANCE_SECONDS = 1.0
 
 
 def _user_private_dir(path: Path, *, create: bool) -> Path:
@@ -64,7 +65,10 @@ def user_data_dir(app_name: str = "ephemdir", *, create: bool = True) -> Path:
     """
     override = os.environ.get("EPHEMDIR_DATA_DIR")
     if override:
-        return _user_private_dir(Path(override), create=create)
+        override_path = Path(override).expanduser()
+        if not override_path.is_absolute():
+            override_path = Path.home() / override_path
+        return _user_private_dir(override_path, create=create)
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
         root = Path(base) if base else Path.home() / "AppData" / "Local"
@@ -72,7 +76,12 @@ def user_data_dir(app_name: str = "ephemdir", *, create: bool = True) -> Path:
         root = Path.home() / "Library" / "Application Support"
     else:
         base = os.environ.get("XDG_DATA_HOME")
-        root = Path(base) if base else Path.home() / ".local" / "share"
+        xdg_path = Path(base) if base else None
+        root = (
+            xdg_path
+            if xdg_path is not None and xdg_path.is_absolute()
+            else Path.home() / ".local" / "share"
+        )
 
     path = root / app_name
     # The registry may reference private paths, so keep the dir owner-only.
@@ -93,7 +102,10 @@ def user_config_dir(app_name: str = "ephemdir", *, create: bool = True) -> Path:
     """
     override = os.environ.get("EPHEMDIR_CONFIG_DIR")
     if override:
-        return _user_private_dir(Path(override), create=create)
+        override_path = Path(override).expanduser()
+        if not override_path.is_absolute():
+            override_path = Path.home() / override_path
+        return _user_private_dir(override_path, create=create)
     if sys.platform == "win32":
         base = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
         root = Path(base) if base else Path.home() / "AppData" / "Roaming"
@@ -101,7 +113,12 @@ def user_config_dir(app_name: str = "ephemdir", *, create: bool = True) -> Path:
         root = Path.home() / "Library" / "Application Support"
     else:
         base = os.environ.get("XDG_CONFIG_HOME")
-        root = Path(base) if base else Path.home() / ".config"
+        xdg_path = Path(base) if base else None
+        root = (
+            xdg_path
+            if xdg_path is not None and xdg_path.is_absolute()
+            else Path.home() / ".config"
+        )
 
     path = root / app_name
     return _user_private_dir(path, create=create)
@@ -114,9 +131,8 @@ def boot_session_id() -> str | None:
     stepping the system time (NTP, manual changes) can never make ephemdir
     believe the machine rebooted. Linux exposes
     ``/proc/sys/kernel/random/boot_id``; Windows keeps a per-boot counter in
-    the registry. macOS returns ``None`` and falls back to the boot-time
-    comparison (``kern.boottime`` is a stored value, not derived from
-    uptime, so it is comparatively stable there).
+    the registry. macOS exposes ``kern.bootsessionuuid``. This avoids treating
+    two fast boots less than two minutes apart as the same session.
     """
     if sys.platform.startswith("linux"):
         try:
@@ -126,7 +142,38 @@ def boot_session_id() -> str | None:
             return None
     if sys.platform == "win32":
         return _boot_session_id_windows()
+    if sys.platform == "darwin":
+        return _boot_session_id_macos()
     return None
+
+
+def _boot_session_id_macos() -> str | None:
+    """Read macOS' kernel-provided UUID for the current boot session.
+
+    ``kern.bootsessionuuid`` is independent of wall-clock adjustments and
+    changes on every boot. Older or restricted hosts may not expose it; those
+    hosts fall back to the exact ``kern.boottime`` comparison used for legacy
+    registry entries.
+    """
+    import subprocess  # nosec B404
+    import uuid
+
+    executable = resolve_system_executable("sysctl")
+    if executable is None:
+        return None
+    try:
+        output = subprocess.check_output(  # nosec B603
+            [executable, "-n", "kern.bootsessionuuid"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5.0,
+            env=minimal_subprocess_env(),
+            cwd=stable_subprocess_cwd(),
+        )
+        value = str(uuid.UUID(output.strip()))
+        return f"darwin-boot-{value}"
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
 
 
 def _boot_session_id_windows() -> str | None:  # pragma: no cover - Windows only
@@ -174,7 +221,12 @@ def same_boot(a: float | None, b: float | None) -> bool:
     """
     if a is None or b is None:
         return True
-    return abs(a - b) <= _BOOT_TOLERANCE_SECONDS
+    tolerance = (
+        _MACOS_BOOT_TOLERANCE_SECONDS
+        if sys.platform == "darwin"
+        else _BOOT_TOLERANCE_SECONDS
+    )
+    return abs(a - b) <= tolerance
 
 
 def _boot_time_linux() -> float | None:
@@ -205,10 +257,18 @@ def _boot_time_macos() -> float | None:
             cwd=stable_subprocess_cwd(),
         )
         # Output looks like: "{ sec = 1700000000, usec = 123456 } ..."
-        marker = "sec = "
-        start = output.index(marker) + len(marker)
-        end = output.index(",", start)
-        return float(output[start:end].strip())
+        sec_marker = "sec = "
+        sec_start = output.index(sec_marker) + len(sec_marker)
+        sec_end = output.index(",", sec_start)
+        seconds = float(output[sec_start:sec_end].strip())
+        usec_marker = "usec = "
+        try:
+            usec_start = output.index(usec_marker, sec_end) + len(usec_marker)
+            usec_end = output.index(" ", usec_start)
+            microseconds = int(output[usec_start:usec_end].strip())
+        except (ValueError, IndexError):
+            microseconds = 0
+        return seconds + microseconds / 1_000_000.0
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
 

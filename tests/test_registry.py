@@ -613,3 +613,51 @@ def test_state_bounds_reject_oversized_forward_compatible_entry(tmp_path):
 
     with pytest.raises(RegistryTooLargeError, match="larger"):
         registry_module._validate_state_bounds({str(tmp_path / "x"): entry})
+
+
+def test_scheduled_registry_refuses_to_recreate_vanished_state_root(tmp_path, monkeypatch):
+    state_dir = tmp_path / "vanished-state"
+    reg = Registry(path=state_dir / "registry.json")
+    monkeypatch.setenv("EPHEMDIR_REQUIRE_EXISTING_STATE_DIR", "1")
+
+    with pytest.raises(RegistryUnavailableError, match="state directory disappeared"):
+        with reg.transaction():
+            pass
+
+    assert not state_dir.exists()
+
+
+def test_scheduled_registry_refuses_missing_registry_file_in_existing_state_root(
+    tmp_path, monkeypatch
+):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    reg = Registry(path=state_dir / "registry.json")
+    monkeypatch.setenv("EPHEMDIR_REQUIRE_EXISTING_REGISTRY", "1")
+
+    with pytest.raises(RegistryUnavailableError, match="registry disappeared"):
+        reg.load()
+
+    assert not reg.path.exists()
+
+
+def test_registry_rejects_root_only_phase_without_identity():
+    staging = "/tmp/.x.1-aabbccdd.deleting"
+    base = _entry(
+        state="recovery",
+        claim_id=None,
+        staging_path=staging,
+        delete_phase="root-only",
+        marker_id="a" * 32,
+        dev=1,
+        ino=2,
+    )
+    assert registry_module._valid_entry("/tmp/x", base) is True
+
+    missing_dev = {k: v for k, v in base.items() if k != "dev"}
+    missing_ino = {k: v for k, v in base.items() if k != "ino"}
+    assert registry_module._valid_entry("/tmp/x", missing_dev) is False
+    assert registry_module._valid_entry("/tmp/x", missing_ino) is False
+    assert registry_module._valid_entry("/tmp/x", {**base, "staging_path": None}) is False
+    foreign_staging = {**base, "staging_path": "/tmp/not-staging"}
+    assert registry_module._valid_entry("/tmp/x", foreign_staging) is False

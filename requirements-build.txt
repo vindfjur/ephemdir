@@ -1,15 +1,15 @@
 # Fully pinned, hash-checked toolchain for release builds.
 # Used by .github/workflows/publish.yml with `--require-hashes` and
 # `python -m build --no-isolation`, so the build backend version can never
-# drift via the `requires = ["setuptools>=78.1.1"]` range in pyproject.toml.
+# drift via the `requires = ["setuptools>=83.0.0"]` range in pyproject.toml.
 build==1.5.0 \
     --hash=sha256:13f3eecb844759ab66efec90ca17639bbf14dc06cb2fdf37a9010322d9c50a6f
 packaging==26.2 \
     --hash=sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e
 pyproject_hooks==1.2.0 \
     --hash=sha256:9e5c6bfa8dcc30091c74b0cf803c81fdd29d94f01992a7707bc97babb1141913
-setuptools==82.0.1 \
-    --hash=sha256:a59e362652f08dcd477c78bb6e7bd9d80a7995bc73ce773050228a348ce2e5bb
+setuptools==83.0.0 \
+    --hash=sha256:29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3
 # `build` imports tomllib, which is stdlib only on 3.11+; on 3.10 it pulls in
 # tomli. Pinned + hashed here so the 3.10 build job satisfies --require-hashes
 # (the universal py3-none-any wheel plus the sdist cover every 3.10 host).

@@ -291,6 +291,7 @@ def test_effective_service_environment_opens_private_state_dirs(tmp_path, monkey
 
     monkeypatch.setattr(_service, "user_data_dir", lambda create=False: data_dir)
     monkeypatch.setattr(_service, "user_config_dir", lambda create=False: config_dir)
+    monkeypatch.setattr(_service, "_volatile_service_state_reason", lambda path: None)
     monkeypatch.setattr(
         _service,
         "open_private_directory",
@@ -302,13 +303,17 @@ def test_effective_service_environment_opens_private_state_dirs(tmp_path, monkey
     assert env == {
         "EPHEMDIR_DATA_DIR": str(data_dir),
         "EPHEMDIR_CONFIG_DIR": str(config_dir),
+        "EPHEMDIR_REQUIRE_EXISTING_STATE_DIR": "1",
+        "EPHEMDIR_REQUIRE_EXISTING_REGISTRY": "1",
     }
     assert opened == [(data_dir, True), (config_dir, True)]
+    assert (data_dir / "registry.json").is_file()
 
 
 def test_effective_service_environment_refuses_unsafe_state_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(_service, "user_data_dir", lambda create=False: tmp_path / "data")
     monkeypatch.setattr(_service, "user_config_dir", lambda create=False: tmp_path / "config")
+    monkeypatch.setattr(_service, "_volatile_service_state_reason", lambda path: None)
 
     def reject(directory, *, create):
         raise OSError("unsafe permissions")
@@ -735,6 +740,8 @@ def test_uninstall_systemd_removes_inactive_units(tmp_path, monkeypatch):
     timer = tmp_path / f"{SYSTEMD_UNIT}.timer"
     service.write_text("", encoding="utf-8")
     timer.write_text("", encoding="utf-8")
+    for unit in (service, timer):
+        _service._record_installed_file(unit, "")
     checked: list[list[str]] = []
 
     monkeypatch.setattr(_service, "_systemd_dir", lambda: tmp_path)
@@ -785,11 +792,14 @@ def test_launchd_install_and_uninstall_paths(tmp_path, monkeypatch):
     checked: list[tuple[list[str], str]] = []
 
     monkeypatch.setattr(_service, "_launchd_path", lambda: plist)
-    monkeypatch.setattr(
-        _service,
-        "_write_service_file",
-        lambda path, content: written.append((path, content)),
-    )
+
+    def fake_write(path, content):
+        written.append((path, content))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        os.chmod(path, 0o600)
+
+    monkeypatch.setattr(_service, "_write_service_file", fake_write)
     monkeypatch.setattr(
         _service,
         "_effective_service_environment",
@@ -813,7 +823,6 @@ def test_launchd_install_and_uninstall_paths(tmp_path, monkeypatch):
     assert scheduler_calls == [("launchctl", ["unload", str(plist)])]
     assert checked == [(["/bin/launchctl", "load", str(plist)], "launchctl load")]
 
-    plist.write_text("", encoding="utf-8")
     assert _service._uninstall_launchd() == f"removed LaunchAgent {plist}"
     assert not plist.exists()
 
@@ -870,10 +879,13 @@ def test_systemd_install_writes_units_and_enables_timer(tmp_path, monkeypatch):
     )
 
     assert "installed systemd user timer" in _service._install_systemd(13)
-    assert sorted(path.name for path in written) == [
+    unit_names = sorted(path.name for path in written if path.name != "installed-files.json")
+    assert unit_names == [
         f"{SYSTEMD_UNIT}.service",
         f"{SYSTEMD_UNIT}.timer",
     ]
+    # Each unit's exact digest is recorded in the installed-files manifest.
+    assert [path.name for path in written].count("installed-files.json") == 2
     assert checked[-1] == (
         ["/usr/bin/systemctl", "--user", "enable", "--now", f"{SYSTEMD_UNIT}.timer"],
         "systemctl enable",
@@ -1426,3 +1438,174 @@ def test_install_service_surfaces_balanced_warning(monkeypatch, caplog):
 
     assert result == "installed launchd"
     assert any("group-writable" in record.message for record in caplog.records)
+
+
+def test_macos_service_rejects_registry_under_per_user_tmpdir(monkeypatch):
+    monkeypatch.setattr(_service.sys, "platform", "darwin")
+    path = Path("/private/var/folders/ab/cdef/T/ephemdir-data")
+
+    reason = _service._volatile_service_state_reason(path)
+
+    assert reason is not None
+    assert "/private/var/folders" in reason
+
+
+def test_service_rejects_state_inside_marked_ephemeral_tree(tmp_path, monkeypatch):
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / ".ephemdir").write_text("marker", encoding="utf-8")
+    data_dir = managed / "state"
+    config_dir = tmp_path / "config"
+    monkeypatch.setattr(_service, "user_data_dir", lambda create=False: data_dir)
+    monkeypatch.setattr(_service, "user_config_dir", lambda create=False: config_dir)
+    monkeypatch.setattr(_service, "_volatile_service_state_reason", lambda path: None)
+
+    with pytest.raises(_service.ServiceError, match="inside tracked/marked ephemeral"):
+        _service._effective_service_environment()
+
+
+def test_verified_removal_refuses_modified_and_unrecorded(tmp_path):
+    target = tmp_path / "unit.file"
+    target.write_text("original", encoding="utf-8")
+
+    with pytest.raises(_service.ServiceError, match="not recorded"):
+        _service._remove_recorded_installed_file(target)
+    assert target.is_file()
+
+    _service._record_installed_file(target, "original")
+    target.write_text("edited", encoding="utf-8")
+    with pytest.raises(_service.ServiceError, match="no longer matches"):
+        _service._remove_recorded_installed_file(target)
+    assert target.is_file()
+
+    target.write_text("original", encoding="utf-8")
+    _service._remove_recorded_installed_file(target)
+    assert not target.exists()
+    assert _service._load_manifest() == {}
+
+
+def test_verified_removal_never_follows_symlink(tmp_path):
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me", encoding="utf-8")
+    target = tmp_path / "unit.file"
+    _service._record_installed_file(target, "keep me")
+    target.symlink_to(victim)
+
+    with pytest.raises(_service.ServiceError):
+        _service._remove_recorded_installed_file(target)
+    assert victim.read_text(encoding="utf-8") == "keep me"
+    assert target.is_symlink()
+
+
+def test_verified_removal_refuses_group_writable_file(tmp_path):
+    target = tmp_path / "unit.file"
+    target.write_text("original", encoding="utf-8")
+    _service._record_installed_file(target, "original")
+    os.chmod(target, 0o620)
+
+    with pytest.raises(_service.ServiceError, match="writable by group"):
+        _service._remove_recorded_installed_file(target)
+    assert target.is_file()
+
+
+def test_installed_file_state_classifications(tmp_path):
+    target = tmp_path / "f"
+    assert _service._installed_file_state(target, None) == "not-installed"
+    target.write_text("body", encoding="utf-8")
+    assert _service._installed_file_state(target, None) == "unrecorded"
+    _service._record_installed_file(target, "body")
+    assert _service._installed_file_state(target, "body") == "installed"
+    assert _service._installed_file_state(target, "newer body") == "outdated"
+    target.write_text("tampered", encoding="utf-8")
+    assert _service._installed_file_state(target, "body") == "modified"
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    assert _service._installed_file_state(link, None) == "irregular"
+
+
+def test_manifest_survives_garbage_and_foreign_shapes(tmp_path, monkeypatch):
+    manifest = tmp_path / "installed-files.json"
+    monkeypatch.setattr(_service, "_manifest_path", lambda: manifest)
+    assert _service._load_manifest() == {}
+    manifest.write_text("not json", encoding="utf-8")
+    assert _service._load_manifest() == {}
+    manifest.write_text('["list"]', encoding="utf-8")
+    assert _service._load_manifest() == {}
+    manifest.write_text('{"/tmp/x": "SHORT", "/tmp/y": 5, "/tmp/z": "' + "a" * 64 + '"}',
+                        encoding="utf-8")
+    os.chmod(manifest, 0o600)
+    assert _service._load_manifest() == {"/tmp/z": "a" * 64}
+
+
+def test_service_status_darwin_read_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(_service.sys, "platform", "darwin")
+    plist = tmp_path / "agent.plist"
+    content = _service.render_launchd_plist(
+        60,
+        ["/usr/bin/python3", "-I", "-m", "ephemdir", "sweep"],
+        environment={
+            "EPHEMDIR_DATA_DIR": str(tmp_path / "data"),
+            "EPHEMDIR_CONFIG_DIR": str(tmp_path / "config"),
+        },
+    )
+    plist.write_text(content, encoding="utf-8")
+    _service._record_installed_file(plist, content)
+    monkeypatch.setattr(_service, "_launchd_path", lambda: plist)
+    monkeypatch.setattr(
+        _service,
+        "_run_scheduler",
+        lambda name, args: type("C", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+    )
+
+    status = _service.service_status()
+
+    assert status["manager"] == "launchd"
+    assert status["installed"] is True
+    assert status["active"] is True
+    assert status["files"] == {str(plist): "installed"}
+    assert status["environment"]["EPHEMDIR_DATA_DIR"] == str(tmp_path / "data")
+    assert status["registry_present"] is False
+
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "registry.json").write_text("{}", encoding="utf-8")
+    os.chmod(tmp_path / "data" / "registry.json", 0o600)
+    assert _service.service_status()["registry_present"] is True
+
+
+def test_service_status_linux_reports_units_and_pinned_env(tmp_path, monkeypatch):
+    monkeypatch.setattr(_service.sys, "platform", "linux")
+    units = _service.render_systemd_units(
+        60,
+        ["/usr/bin/python3", "-I", "-m", "ephemdir", "sweep"],
+        environment={
+            "EPHEMDIR_DATA_DIR": "/data dir",
+            "EPHEMDIR_REQUIRE_EXISTING_REGISTRY": "1",
+        },
+    )
+    for name, content in units.items():
+        path = tmp_path / name
+        path.write_text(content, encoding="utf-8")
+        _service._record_installed_file(path, content)
+    monkeypatch.setattr(_service, "_systemd_dir", lambda: tmp_path)
+    monkeypatch.setattr(_service, "_resolve_scheduler", lambda name: name)
+    monkeypatch.setattr(
+        _service,
+        "_run",
+        lambda command: type("C", (), {"returncode": 0, "stdout": "active\n", "stderr": ""})(),
+    )
+
+    status = _service.service_status()
+
+    assert status["manager"] == "systemd"
+    assert status["installed"] is True
+    assert status["active"] is True
+    assert set(status["files"].values()) == {"installed"}
+    assert status["environment"]["EPHEMDIR_DATA_DIR"] == "/data dir"
+    assert status["environment"]["EPHEMDIR_REQUIRE_EXISTING_REGISTRY"] == "1"
+
+
+def test_service_status_unsupported_platform(monkeypatch):
+    monkeypatch.setattr(_service.sys, "platform", "win32")
+    status = _service.service_status()
+    assert status["installed"] is False
+    assert status["manager"] is None

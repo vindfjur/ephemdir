@@ -110,7 +110,7 @@ jobs:
       - name: Build and smoke-test distributions
         # Hash-pinned toolchain + --no-isolation: the exact build backend is
         # the one from requirements-build.txt, not whatever the resolver
-        # picks for `requires = ["setuptools>=78.1.1"]` in an isolated env.
+        # picks for `requires = ["setuptools>=83.0.0"]` in an isolated env.
         run: |
           python -m pip install --require-hashes -r requirements-build.txt
           python -m build --no-isolation

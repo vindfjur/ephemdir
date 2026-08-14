@@ -28,6 +28,7 @@ COUNTERS = ("created", "swept", "kept", "removed")
 
 _MAX_STATS_BYTES = 64 * 1024
 _OWNER_ONLY_FILE_MODE = 0o600
+_MAX_COUNTER_VALUE = (1 << 63) - 1
 
 
 class StatsLedger:
@@ -71,7 +72,11 @@ class StatsLedger:
         if isinstance(data, dict):
             for name in COUNTERS:
                 value = data.get(name)
-                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                if (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and 0 <= value <= _MAX_COUNTER_VALUE
+                ):
                     counters[name] = value
         return counters
 
@@ -83,16 +88,21 @@ class StatsLedger:
             logger.debug("could not record stats %s: %s", deltas, error)
 
     def _record(self, deltas: dict[str, int]) -> None:
-        wanted = {
-            name: int(delta)
-            for name, delta in deltas.items()
-            if name in COUNTERS and int(delta)
-        }
+        wanted: dict[str, int] = {}
+        for name, delta in deltas.items():
+            if name not in COUNTERS:
+                continue
+            if not isinstance(delta, int) or isinstance(delta, bool):
+                raise TypeError(f"stats delta for {name} must be an integer")
+            if delta < 0:
+                raise ValueError(f"stats delta for {name} must be non-negative")
+            if delta:
+                wanted[name] = delta
         if not wanted:
             return
         current = self.snapshot()
         for name, delta in wanted.items():
-            current[name] = max(0, current[name] + delta)
+            current[name] = min(_MAX_COUNTER_VALUE, current[name] + delta)
         path = self._path(create=True)
         payload = json.dumps(current, indent=2, sort_keys=True, allow_nan=False).encode("utf-8")
         directory = path.parent

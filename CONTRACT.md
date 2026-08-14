@@ -22,17 +22,28 @@ The public API is exactly the names exported from the top-level package
 tempdir, sweep, registered, keep, extend, remove, resolve, prune, recover,
 explain, plan_sweep, parse_size,
 CleanupDecision, CleanupPolicy, SweepMode, EphemeralDirectory,
+EphemdirError, RegistryError, RegistryUnavailableError, CorruptRegistryError,
+UnsafeRegistryError, UnsupportedPlatformError, SafetyError, TargetError,
 __version__, __author__
 ```
 
 Anything imported from a submodule (especially `ephemdir._*`) is internal and
 may change at any time.
 
+`extend` raises `OSError` when the path no longer holds the directory ephemdir
+created (it was deleted and replaced): that entry can never be cleaned up
+automatically, so a fresh deadline would be a promise nothing can keep. The
+recorded lifetime is left untouched.
+
 ## CLI commands
 
 Stable subcommands: `new`, `list`, `tree`, `path`, `last`, `keep`, `extend`,
 `rm`, `sweep`, `explain`, `stats`, `prune`, `recover`, `watch`, `doctor`,
-`shell-init`, `completion`, `menu`, `install-service`, `uninstall-service`.
+`shell-init`, `completion`, `menu`, `service`, `install-service`,
+`uninstall-service`. `service` groups `install`, `uninstall` and the
+read-only `status` (`install-service`/`uninstall-service` are aliases);
+`completion` groups `show`, `install`, `uninstall` and the read-only
+`status`.
 
 `list`, `tree`, `sweep` and `keep` accept `--tag` (repeatable; matches
 directories carrying every given tag). For `sweep` the tag filter only narrows
@@ -41,6 +52,17 @@ what is removed; for `keep` it untracks every matching directory.
 Global flags: `--version`, `-v/--verbose`, `-q/--quiet`,
 `--color {auto,always,never}`. Long options are never abbreviated
 (`allow_abbrev=False`).
+
+## Cleanup timing
+
+Lifetimes are deadlines, not timers. A directory becomes **due** when its
+lifetime expires (or, for restart-scoped entries, when the boot session
+changes) and is removed by the first sweep that runs afterwards and can
+verify ownership. Nothing runs while the machine is asleep or off, so the
+wall-clock delay between expiry and removal is bounded only by when a sweep
+next happens — the scheduler interval plus any sleep time. Deletion is never
+earlier than the deadline; it may be arbitrarily later. Callers that need a
+guarantee must run `sweep` themselves.
 
 ## Exit codes
 
@@ -77,7 +99,8 @@ escaped (`\xNN`) before any styling.
 ## JSON contract
 
 `--json` is available on the read-only commands `list`, `tree`, `path`, `last`,
-`explain` and `doctor`. JSON is strict (no `NaN`/`Infinity`), printed to stdout,
+`explain`, `doctor`, `stats`, `completion status` and `service status`. JSON is
+strict (no `NaN`/`Infinity`), printed to stdout,
 indented. Durations are integer **seconds** (`remaining_seconds`), sizes are
 integer **bytes** (`size_bytes`), and timestamps (`created_at`, `expires_at`)
 are Unix epoch **seconds and may be fractional**. Unknown keys may be **added**
@@ -86,19 +109,40 @@ in a backward-compatible way; existing keys and their meaning are stable.
 - `list --json` → array of objects with: `path`, `name`, `status`,
   `lifecycle_state`, `exists`, `original_state`, `staging_path`,
   `staging_state`, `created_at`, `expires_at`, `remaining_seconds`,
-  `remove_on_restart`, `keep_while_in_use`, `tags`, `description`.
+  `remove_on_restart`, `keep_while_in_use`, `tags`, `description`. Within one
+  row `exists` and `original_state` always agree (`true`/`"present"`,
+  `false`/`"missing"`, `null`/`"unknown"`): both come from a single probe, so
+  a sweep running concurrently cannot produce a self-contradicting row. They
+  describe the **original path only**, never the staging copy — a row in
+  `deleting` or `recovery` whose directory has already been renamed reports
+  `false`/`"missing"` here and locates the tree under `staging_path`.
 - `tree --json` → array of: `path`, `name`, `parent`, `status`, `size_bytes`,
   `size_complete`, `tags`. `size_bytes` is `null` for directories ephemdir does
   not own or that are absent; a `false` `size_complete` means the value is a
   lower bound (scan budget reached).
 - `explain --json` → object with: `path`, `name`, `status`, `due`,
   `destructive_allowed`, `remaining_seconds`, `size_bytes`, `max_size_bytes`,
-  `reasons`, `blocked_by`, `decision` (array of `{check, ok, detail}`), `tags`,
-  `description`.
+  `reasons`, `blocked_by`, `decision` (array of `{check, ok, detail}`),
+  `remove_on_restart`, `keep_while_in_use`, `tags`, `description`. The two
+  boolean triggers are also carried by `list --json`; a `null`
+  `remaining_seconds` does not mean the directory is permanent. The verdict and
+  the metadata beside it are read from **one registry snapshot**, so a
+  concurrent `extend`/`keep`/sweep cannot produce a payload whose deadline
+  disagrees with its own `reasons`.
 - `path --json`, `last --json` → object with `path`, `name`.
 - `doctor --json` → array of `{name, ok, message, hint}`.
 - `stats --json` → object with `created`, `swept`, `kept`, `removed`,
   `currently_tracked` (all integers).
+- `completion status --json` → array of `{shell, path, status}`. `status` is one
+  of `not-installed`, `installed`, `outdated`, `modified`, `unrecorded`,
+  `foreign`, `irregular`, `unreadable` or `unsafe`.
+- `service status --json` → object with `platform`, `manager`, `unit`, `files`,
+  `installed`, `active`, `environment`, `command`, `working_directory`,
+  `command_valid`, `working_directory_valid`, `registry_status` and
+  `registry_present`. `files` maps managed paths to the same verification
+  states used by completion status; `active` and validation fields may be
+  `null` when the host cannot answer safely. `registry_status` is `present`,
+  `missing`, `unsafe`, `unreadable` or `null`.
 
 ## Names and tags
 

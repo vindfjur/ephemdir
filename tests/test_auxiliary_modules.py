@@ -6,6 +6,7 @@ import ctypes
 import os
 import runpy
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -97,25 +98,86 @@ def test_default_backend_selects_platform_backend(monkeypatch):
     assert isinstance(default_backend(), WindowsBackend)
 
 
-def test_posix_backend_descriptor_and_unsupported_operations(tmp_path, monkeypatch):
+def test_posix_backend_descriptor_and_active_operations(tmp_path, monkeypatch):
     backend = PosixBackend()
 
     assert backend.capabilities().safe_delete is (os.name == "posix")
     assert backend.validate_parent(tmp_path).ok is True
     assert backend.validate_parent(tmp_path / "missing").ok is False
 
+    # The four lifecycle operations are implemented (no NotImplementedError
+    # in the active path, APA-BE-001).
+    created = backend.create_owned_directory(tmp_path, "made")
+    assert created.path == tmp_path / "made"
+    assert created.path.is_dir()
+    assert (created.path / ".ephemdir").read_text(encoding="ascii").strip() == created.marker_id
+    entry = {"marker_id": created.marker_id, "ino": created.ino}
+    assert backend.probe_ownership(created.path, entry).status == "ours"
+    assert backend.probe_ownership(created.path, {}).status == "unverified"
+    # An ordinary directory is never accepted as a claimed staging tree.
+    with pytest.raises(posix_module.StagingIdentityError):
+        backend.delete_claimed_tree(created.path, {})
+    assert created.path.is_dir()  # refusal deleted nothing
+
     monkeypatch.setattr(posix_module.os, "name", "nt")
     assert backend.capabilities().safe_delete is False
     assert "POSIX" in backend.capabilities().reason
 
-    with pytest.raises(NotImplementedError):
-        backend.create_owned_directory(tmp_path, "x", "0" * 32)
-    with pytest.raises(NotImplementedError):
-        backend.probe_ownership(tmp_path, {})
-    with pytest.raises(NotImplementedError):
-        backend.claim(tmp_path, {}, "staging")
-    with pytest.raises(NotImplementedError):
-        backend.delete_claimed_tree(None, None)  # type: ignore[arg-type]
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX trust-walk semantics")
+def test_posix_backend_validate_parent_never_follows_symlinks(tmp_path):
+    backend = PosixBackend()
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    (real / "inner").mkdir(mode=0o700)
+    link = tmp_path / "link"
+    os.symlink(real, link)
+
+    # Final component is a symlink: refused, never followed.
+    assert backend.validate_parent(link).ok is False
+    # Intermediate component is a symlink: refused by the no-follow walk.
+    assert backend.validate_parent(link / "inner").ok is False
+    # The same directories through their real path stay acceptable.
+    assert backend.validate_parent(real).ok is True
+    assert backend.validate_parent(real / "inner").ok is True
+
+    # A regular file is not a parent directory.
+    file_path = tmp_path / "file.txt"
+    file_path.write_text("x", encoding="utf-8")
+    assert backend.validate_parent(file_path).ok is False
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX trust-walk semantics")
+def test_posix_backend_validate_parent_mode_bit_policy(tmp_path):
+    # Mode-bit policy, not an access check, so it holds under root as well:
+    # owner-owned sticky world-writable (/tmp-like) is trusted, owner-owned
+    # non-sticky group-writable is not (entry-swap risk).
+    backend = PosixBackend()
+    sticky = tmp_path / "sticky"
+    sticky.mkdir(mode=0o700)
+    os.chmod(sticky, 0o1777)
+    assert backend.validate_parent(sticky).ok is True
+
+    loose = tmp_path / "loose"
+    loose.mkdir(mode=0o700)
+    os.chmod(loose, 0o770)
+    validation = backend.validate_parent(loose)
+    assert validation.ok is False
+    assert "sticky" in (validation.reason or "")
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS /var symlink alias")
+def test_posix_backend_validate_parent_rejects_uncanonical_var_alias(tmp_path):
+    # validate_parent does not canonicalise: core resolves /var ->
+    # /private/var (_canonical_private_dir_path) BEFORE the backend sees the
+    # path, and the raw /var alias is refused as a symlink component.
+    parts = tmp_path.parts
+    if parts[1:3] != ("private", "var"):
+        pytest.skip("pytest tmp dir is not under /private/var")
+    backend = PosixBackend()
+    alias = Path("/").joinpath("var", *parts[3:])
+    assert backend.validate_parent(alias).ok is False
+    assert backend.validate_parent(tmp_path).ok is True
 
 
 def test_windows_backend_descriptor_and_disabled_operations(tmp_path, monkeypatch):
@@ -126,7 +188,12 @@ def test_windows_backend_descriptor_and_disabled_operations(tmp_path, monkeypatc
     assert backend.validate_parent(tmp_path).ok is True
     assert backend.validate_parent(tmp_path / "missing").ok is False
     assert backend.probe_ownership(tmp_path, {}).status == "unsupported"
-    assert backend.delete_claimed_tree(None, None).removed is False  # type: ignore[arg-type]
+    with pytest.raises(NotImplementedError):
+        backend.preflight_claim_source(tmp_path, 0, {}, allow_unverified=False)
+    with pytest.raises(NotImplementedError):
+        backend.rename_to_staging(tmp_path, tmp_path, 0, 0)
+    with pytest.raises(NotImplementedError):
+        backend.delete_claimed_tree(tmp_path, {})
 
     monkeypatch.setattr(
         windows_module,
@@ -137,8 +204,6 @@ def test_windows_backend_descriptor_and_disabled_operations(tmp_path, monkeypatc
 
     with pytest.raises(NotImplementedError):
         backend.create_owned_directory(tmp_path, "x", "0" * 32)
-    with pytest.raises(NotImplementedError):
-        backend.claim(tmp_path, {}, "staging")
 
 
 def test_policy_combines_reasons_and_blockers(monkeypatch):

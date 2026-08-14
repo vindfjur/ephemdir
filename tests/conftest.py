@@ -17,6 +17,10 @@ def _isolated_user_dirs(tmp_path_factory, monkeypatch):
     base = tmp_path_factory.mktemp("ephemdir-home")
     monkeypatch.setenv("EPHEMDIR_DATA_DIR", str(base / "data"))
     monkeypatch.setenv("EPHEMDIR_CONFIG_DIR", str(base / "config"))
+    # Completion installs resolve their targets through XDG; point them at
+    # the sandbox so no test can ever write into the real home directory.
+    monkeypatch.setenv("XDG_DATA_HOME", str(base / "xdg-data"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(base / "xdg-config"))
 
 
 @pytest.fixture()

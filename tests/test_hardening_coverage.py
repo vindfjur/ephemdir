@@ -101,11 +101,38 @@ def test_platform_boot_identity_and_time_probes(monkeypatch):
     assert _platform.boot_session_id() == "win-7"
 
     monkeypatch.setattr(_platform.sys, "platform", "darwin")
-    assert _platform.boot_session_id() is None
+    monkeypatch.setattr(
+        _platform,
+        "_boot_session_id_macos",
+        lambda: "darwin-boot-11111111-2222-3333-4444-555555555555",
+    )
+    assert (
+        _platform.boot_session_id()
+        == "darwin-boot-11111111-2222-3333-4444-555555555555"
+    )
     assert _platform.same_boot(None, 1.0) is True
-    assert _platform.same_boot(100.0, 200.0) is True
-    assert _platform.same_boot(100.0, 400.0) is False
+    assert _platform.same_boot(100.0, 100.5) is True
+    assert _platform.same_boot(100.0, 102.0) is False
 
+
+
+def test_platform_macos_boot_session_uuid_probe(monkeypatch):
+    monkeypatch.setattr(_platform, "resolve_system_executable", lambda name: "/usr/sbin/sysctl")
+    monkeypatch.setattr(_platform, "minimal_subprocess_env", lambda: {"PATH": "/usr/sbin"})
+    monkeypatch.setattr(_platform, "stable_subprocess_cwd", lambda: "/")
+
+    def fake_check_output(command, **kwargs):
+        assert command == ["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"]
+        return "11111111-2222-3333-4444-555555555555\n"
+
+    monkeypatch.setattr(subprocess, "check_output", fake_check_output)
+    assert (
+        _platform._boot_session_id_macos()
+        == "darwin-boot-11111111-2222-3333-4444-555555555555"
+    )
+
+    monkeypatch.setattr(subprocess, "check_output", lambda command, **kwargs: "not-a-uuid")
+    assert _platform._boot_session_id_macos() is None
 
 def test_platform_boot_time_parsers(monkeypatch):
     monkeypatch.setattr(builtins, "open", lambda path, encoding=None: io.StringIO("10.5 99\n"))
@@ -124,7 +151,7 @@ def test_platform_boot_time_parsers(monkeypatch):
         return "{ sec = 1700000000, usec = 123456 }\n"
 
     monkeypatch.setattr(subprocess, "check_output", fake_check_output)
-    assert _platform._boot_time_macos() == 1_700_000_000.0
+    assert _platform._boot_time_macos() == 1_700_000_000.123456
 
     monkeypatch.setattr(_platform, "resolve_system_executable", lambda name: None)
     assert _platform._boot_time_macos() is None
